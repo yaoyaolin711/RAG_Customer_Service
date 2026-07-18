@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>历史对话记录</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f5f1ec; color: #1a1410; height: 100vh; display: flex;
+    }
+    .sidebar {
+      width: 300px; min-width: 300px; background: #fff; border-right: 1px solid #eadfd6;
+      display: flex; flex-direction: column;
+    }
+    .sidebar-header {
+      padding: 16px 20px; border-bottom: 1px solid #eadfd6;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .sidebar-header h1 { font-size: 18px; font-weight: 600; }
+    .sidebar-header a { font-size: 13px; color: #fe2c55; text-decoration: none; }
+    .search-box { padding: 12px 20px; }
+    .search-box input {
+      width: 100%; padding: 8px 12px; border: 1px solid #eadfd6; border-radius: 8px;
+      font-size: 14px; outline: none;
+    }
+    .search-box input:focus { border-color: #fe2c55; }
+    .contact-list { flex: 1; overflow-y: auto; }
+    .contact-item {
+      padding: 12px 20px; cursor: pointer; border-bottom: 1px solid #f0ebe6;
+      transition: background 0.15s;
+    }
+    .contact-item:hover { background: #f9f5f0; }
+    .contact-item.active { background: #fe2c55; color: #fff; }
+    .contact-item .name { font-size: 14px; font-weight: 500; }
+    .contact-item .preview {
+      font-size: 12px; color: #7a6a60; margin-top: 2px; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
+    }
+    .contact-item.active .preview { color: rgba(255,255,255,0.8); }
+    .contact-item .time { font-size: 11px; color: #b0a098; float: right; }
+    .contact-item.active .time { color: rgba(255,255,255,0.7); }
+    .main {
+      flex: 1; display: flex; flex-direction: column; background: #fff;
+    }
+    .main-header {
+      padding: 16px 24px; border-bottom: 1px solid #eadfd6;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .main-header h2 { font-size: 16px; font-weight: 600; }
+    .main-header .count { font-size: 13px; color: #7a6a60; }
+    .btn-del {
+      padding: 6px 16px; background: #fee; color: #dc2626; border: 1px solid #fcc;
+      border-radius: 6px; cursor: pointer; font-size: 13px;
+    }
+    .btn-del:hover { background: #fdd; }
+    .messages { flex: 1; overflow-y: auto; padding: 16px 24px; }
+    .msg { margin-bottom: 12px; display: flex; gap: 8px; }
+    .msg .avatar {
+      width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 600; color: #fff;
+    }
+    .msg .avatar.user { background: #fe2c55; }
+    .msg .avatar.assistant { background: #ff6a3d; }
+    .msg .bubble {
+      max-width: 480px; padding: 10px 14px; border-radius: 12px;
+      font-size: 14px; line-height: 1.6;
+    }
+    .msg.user .bubble { background: #f0ebe6; }
+    .msg.assistant .bubble { background: #fef6f0; }
+    .msg .meta {
+      font-size: 11px; color: #b0a098; margin-top: 4px;
+    }
+    .empty-state {
+      display: flex; flex: 1; align-items: center; justify-content: center;
+      color: #b0a098; font-size: 14px; flex-direction: column; gap: 8px;
+    }
+    .empty-state p { margin: 0; }
+    .loading { text-align: center; padding: 40px; color: #7a6a60; }
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: #1a1410; color: #fff; padding: 10px 20px; border-radius: 8px;
+      font-size: 14px; z-index: 999; display: none;
+    }
+    .toast.show { display: block; }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h1>历史对话</h1>
+      <a href="/console/">模拟台</a>
+    </div>
+    <div class="search-box">
+      <input type="text" id="searchInput" placeholder="搜索联系人..." />
+    </div>
+    <div class="contact-list" id="contactList"></div>
+  </aside>
+  <main class="main">
+    <div class="main-header">
+      <div>
+        <h2 id="contactName">选择左侧会话查看</h2>
+        <span class="count" id="msgCount"></span>
+      </div>
+      <button class="btn-del" id="delBtn" style="display:none" onclick="deleteHistory()">删除此会话</button>
+    </div>
+    <div class="messages" id="messages">
+      <div class="empty-state"><p>点击左侧联系人查看对话记录</p></div>
+    </div>
+  </main>
+  <div class="toast" id="toast"></div>
+  <script>
+    let contacts = [];
+    let currentContact = "";
+    let busy = false;
+
+    function apiBase() {
+      const stored = localStorage.getItem("rag_api_base");
+      return stored ? stored.replace(/\/$/, "") : "";
+    }
+
+    function apiUrl(path) {
+      return apiBase() + path;
+    }
+
+    function toast(msg) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.classList.add("show");
+      setTimeout(() => el.classList.remove("show"), 3000);
+    }
+
+    function escapeHtml(text) {
+      return String(text).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }
+
+    async function loadContacts() {
+      const el = document.getElementById("contactList");
+      el.innerHTML = '<div class="loading">加载中...</div>';
+      try {
+        const res = await fetch(apiUrl("/api/v1/history/contacts"));
+        const json = await res.json();
+        if (json.state.code !== 0) throw new Error(json.state.message);
+        contacts = json.data.contacts || [];
+        renderContacts();
+      } catch (e) {
+        el.innerHTML = `<div class="loading">加载失败: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    function renderContacts(filter) {
+      const el = document.getElementById("contactList");
+      filter = (filter || "").trim().toLowerCase();
+      let list = contacts;
+      if (filter) list = list.filter(c => c.contact_username.toLowerCase().includes(filter));
+      if (!list.length) {
+        el.innerHTML = '<div class="loading" style="padding:24px">无匹配会话</div>';
+        return;
+      }
+      el.innerHTML = list.map(c => {
+        const active = c.contact_username === currentContact ? 'active' : '';
+        return `<div class="contact-item ${active}" onclick="selectContact('${escapeHtml(c.contact_username)}')">
+          <span class="time">${escapeHtml(c.last_datetime || '')}</span>
+          <div class="name">${escapeHtml(c.contact_username)}</div>
+          <div class="preview">${escapeHtml(c.last_content || '')}</div>
+        </div>`;
+      }).join('');
+    }
+
+    async function selectContact(name) {
+      if (busy) return;
+      currentContact = name;
+      busy = true;
+      document.getElementById("contactName").textContent = name;
+      document.getElementById("delBtn").style.display = 'inline-block';
+      renderContacts(document.getElementById("searchInput").value);
+
+      const el = document.getElementById("messages");
+      el.innerHTML = '<div class="loading">加载对话...</div>';
+      try {
+        const res = await fetch(apiUrl(`/api/v1/history/${encodeURIComponent(name)}?limit=200`));
+        const json = await res.json();
+        if (json.state.code !== 0) throw new Error(json.state.message);
+        const msgs = json.data.messages || [];
+        document.getElementById("msgCount").textContent = `共 ${msgs.length} 条消息`;
+        if (!msgs.length) {
+          el.innerHTML = '<div class="empty-state"><p>暂无消息</p></div>';
+          return;
+        }
+        el.innerHTML = msgs.map(m => {
+          const role = m.role === "user" ? "user" : "assistant";
+          const label = m.role === "user" ? "买" : "客";
+          return `<div class="msg ${role}">
+            <div class="avatar ${role}">${label}</div>
+            <div>
+              <div class="bubble">${escapeHtml(m.content)}</div>
+            </div>
+          </div>`;
+        }).join('');
+        el.scrollTop = el.scrollHeight;
+      } catch (e) {
+        el.innerHTML = `<div class="loading">加载失败: ${escapeHtml(e.message)}</div>`;
+      } finally {
+        busy = false;
+      }
+    }
+
+    async function deleteHistory() {
+      if (!currentContact) return;
+      if (!confirm(`确定删除「${currentContact}」的所有对话记录？`)) return;
+      try {
+        const res = await fetch(apiUrl(`/api/v1/history/${encodeURIComponent(currentContact)}`), { method: 'DELETE' });
+        const json = await res.json();
+        if (json.state.code !== 0) throw new Error(json.state.message);
+        toast(`已删除「${currentContact}」的历史记录`);
+        currentContact = "";
+        document.getElementById("contactName").textContent = "选择左侧会话查看";
+        document.getElementById("msgCount").textContent = "";
+        document.getElementById("delBtn").style.display = "none";
+        document.getElementById("messages").innerHTML = '<div class="empty-state"><p>点击左侧联系人查看对话记录</p></div>';
+        loadContacts();
+      } catch (e) {
+        toast(`删除失败: ${e.message}`);
+      }
+    }
+
+    document.getElementById("searchInput").addEventListener("input", function() {
+      renderContacts(this.value);
+    });
+
+    loadContacts();
+  </script>
+</body>
+</html>

@@ -1,0 +1,107 @@
+{
+  "jinritemai": {
+    "name": "巨量百应",
+    "url": "https://fxg.jinritemai.com/login/common?from=buyin",
+    "home": "https://buyin.jinritemai.com/dashboard/servicehall/daren-square"
+  },
+  "doudian": {
+    "name": "抖店",
+    "url": "https://fxg.jinritemai.com/ffa/mshop/homepage/index",
+    "home": "https://fxg.jinritemai.com/ffa/mshop/homepage/index"
+  },
+  "weixin": {
+    "name": "微信小店",
+    "url": "https://store.weixin.qq.com/shop",
+    "home": "https://store.weixin.qq.com"
+  },
+  "xianyu": {
+    "name": "闲鱼",
+    "url": "https://www.goofish.com",
+    "home": "https://www.goofish.com"
+  },
+  "xiaohongshu": {
+    "name": "小红书",
+    "url": "https://www.xiaohongshu.com/explore",
+    "home": "https://www.xiaohongshu.com/explore"
+  },
+  "kuaishou": {
+    "name": "快手小店",
+    "url": "https://syt.kwaixiaodian.com/zones/tradeManagement/dealAnalysis",
+    "home": "https://syt.kwaixiaodian.com/zones/tradeManagement/dealAnalysis"
+  },
+  "xiaohongshu_ark": {
+    "name": "小红书千帆",
+    "url": "https://ark.xiaohongshu.com/app-datacenter/overview",
+    "home": "https://ark.xiaohongshu.com/app-datacenter/overview"
+  },
+  "chanmama": {
+    "name": "蝉妈妈",
+    "url": "https://www.chanmama.com/login",
+    "home": "https://www.chanmama.com"
+  },
+  "pigeon": {
+    "name": "巨量百应 Pigeon IM",
+    "url": "https://buyin.jinritemai.com/mpa/pigeonIM",
+    "home": "https://buyin.jinritemai.com/mpa/pigeonIM"
+  },
+  "sulida": {
+    "name": "速力达（抖店）",
+    "url": "https://fxg.jinritemai.com/ffa/mshop/homepage/index",
+    "home": "https://fxg.jinritemai.com/ffa/mshop/homepage/index"
+  },
+  "haizhidong": {
+    "name": "海智（抖店）",
+    "url": "https://fxg.jinritemai.com/ffa/mshop/homepage/index",
+    "home": "https://fxg.jinritemai.com/ffa/mshop/homepage/index"
+  },
+  "shangyue": {
+    "name": "尚悦（抖店）",
+    "url": "https://fxg.jinritemai.com/ffa/mshop/homepage/index",
+    "home": "https://fxg.jinritemai.com/ffa/mshop/homepage/index"
+  },
+  "qiduoduo": {
+    "name": "栖朵朵（小红书）",
+    "url": "https://ark.xiaohongshu.com/app-datacenter/overview",
+    "home": "https://ark.xiaohongshu.com/app-datacenter/overview"
+  },
+  "tanyan": {
+    "name": "坦彦（小红书）",
+    "url": "https://ark.xiaohongshu.com/app-datacenter/overview",
+    "home": "https://ark.xiaohongshu.com/app-datacenter/overview"
+  },
+  "jinchuan": {
+    "name": "锦川（视频号）",
+    "url": "https://store.weixin.qq.com/compass/login",
+    "home": "https://store.weixin.qq.com/compass/login"
+  },
+  "zhihuai": {
+    "name": "致怀（视频号）",
+    "url": "https://store.weixin.qq.com/compass/login",
+    "home": "https://store.weixin.qq.com/compass/login"
+  },
+  "yuanwu": {
+    "name": "原物集（视频号）",
+    "url": "https://store.weixin.qq.com/compass/login",
+    "home": "https://store.weixin.qq.com/compass/login"
+  },
+  "senlin": {
+    "name": "森林运动（快手）",
+    "url": "https://syt.kwaixiaodian.com/zones/tradeManagement/dealAnalysis",
+    "home": "https://syt.kwaixiaodian.com/zones/tradeManagement/dealAnalysis"
+  },
+  "jinchuan_goods": {
+    "name": "微信小店商品机会",
+    "url": "https://store.weixin.qq.com/shop/goods/opprotunity",
+    "home": "https://store.weixin.qq.com/shop/goods/opprotunity"
+  },
+  "jinchuan_talents": {
+    "name": "微信小店人才机会",
+    "url": "https://store.weixin.qq.com/shop?redirect_url=%2Ffindersquare%2Ffind",
+    "home": "https://store.weixin.qq.com/shop/findersquare/find"
+  },
+  "zhihuai_kf": {
+    "name": "致怀客服",
+    "url": "https://store.weixin.qq.com/shop?redirect_url=%2Fkf",
+    "home": "https://store.weixin.qq.com/shop/kf"
+  }
+}

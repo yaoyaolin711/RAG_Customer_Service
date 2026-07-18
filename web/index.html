@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>店铺智能客服 · 模拟台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&family=ZCOOL+QingKe+HuangYou&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">店</div>
+        <div class="brand-text">
+          <h1>店铺智能客服</h1>
+          <p>抖音买家问答 · 约 15 秒内回复</p>
+        </div>
+      </div>
+      <div class="topbar-meta">
+        <div class="status-pill" id="healthPill" title="服务健康">
+          <span class="status-dot" id="healthDot"></span>
+          <span id="healthLabel">检测中…</span>
+        </div>
+        <div class="meta-chip" id="metaChip">知识库加载中…</div>
+        <button type="button" class="btn ghost" id="togglePanelBtn" aria-label="打开链路面板">链路</button>
+        <a href="/console/history.html" class="btn ghost" style="text-decoration:none;font-size:13px">历史</a>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="rail left-rail">
+        <section class="panel">
+          <h2 class="panel-title">模拟买家</h2>
+          <label class="field">
+            <span>用户 ID</span>
+            <input id="userId" type="text" value="buyer_demo_001" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>买家昵称</span>
+            <input id="buyerName" type="text" value="买家小李" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>会话键</span>
+            <input id="sessionKey" type="text" autocomplete="off" />
+          </label>
+          <button type="button" class="btn danger block" id="clearBtn">清空对话</button>
+        </section>
+
+        <section class="panel quick-panel">
+          <h2 class="panel-title">快捷提问</h2>
+          <div id="quickList"></div>
+        </section>
+      </aside>
+
+      <main class="chat-shell">
+        <div class="chat-header">
+          <div class="shop-avatar" aria-hidden="true">客</div>
+          <div>
+            <div class="shop-name">店铺智能客服</div>
+            <div class="shop-sub" id="chatSub">在线 · 咨询 / 交易 / 投诉自动分流</div>
+          </div>
+        </div>
+
+        <div class="messages" id="messages" role="log" aria-live="polite"></div>
+
+        <div class="composer">
+          <div class="toast" id="toast" hidden></div>
+          <form id="chatForm" class="composer-row">
+            <textarea
+              id="messageInput"
+              rows="1"
+              placeholder="模拟买家消息，如：这款多久发货？有运费险吗？"
+              maxlength="2000"
+            ></textarea>
+            <button type="submit" class="btn primary send-btn" id="sendBtn">发送</button>
+          </form>
+        </div>
+      </main>
+
+      <aside class="rail right-rail" id="rightRail">
+        <div class="panel-head">
+          <h2 class="panel-title">本轮链路</h2>
+          <button type="button" class="btn icon" id="closePanelBtn" aria-label="关闭">×</button>
+        </div>
+        <div id="pipelineEmpty" class="empty-state">
+          <p>发送一条消息后，这里展示路由、回复模式与召回片段。</p>
+          <ul>
+            <li>咨询 → RAG 知识库</li>
+            <li>交易 → 查单 / 物流</li>
+            <li>投诉 → 转人工</li>
+            <li>其他 → 闲聊</li>
+          </ul>
+        </div>
+        <div id="pipelineBody" class="pipeline-body" hidden></div>
+      </aside>
+    </div>
+
+    <div class="drawer-mask" id="drawerMask" hidden></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

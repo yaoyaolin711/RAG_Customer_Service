@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# OS / misc
+Thumbs.db
+Desktop.ini
+
+# Secrets
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+!.env.session.example
+**/keys.py
+**/DEEPSEEK_KEY.txt
+
+# Local vector/db artifacts (generated)
+**/*.faiss
+**/*.pkl
+**/*.sqlite
+**/*.db
+
+# If you want to version sample documents, remove this
+**/data/wechat_messages/chat_export/
+
