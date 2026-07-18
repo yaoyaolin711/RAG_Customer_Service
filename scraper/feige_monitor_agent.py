@@ -1518,7 +1518,16 @@ class FeigeMonitorAgent:
                                             _needs_handoff = _api_result.get("needs_handoff", False)
                                         except concurrent.futures.TimeoutError:
                                             logger.warning(f"[REPLY] _api_chat 慢 (20s)，先发兜底: {name}")
-                                            fallback_reply = self._sanitize_reply("嗯嗯，我在呢~，我帮你确认下哈")
+                                            _placeholder_pool = [
+                                                "嗯嗯，我在呢~，我帮你确认下哈",
+                                                "好的，我看看哈~",
+                                                "稍等，我查一下后台~",
+                                                "收到，我核实一下哈~",
+                                                "我看一下数据哈~",
+                                                "行，我确认一下~",
+                                                "嗯，我帮你看看~",
+                                            ]
+                                            fallback_reply = self._sanitize_reply(random.choice(_placeholder_pool))
                                             self.send_message(fallback_reply)
                                             logger.info(f"兜底 [{name}]: {fallback_reply}")
                                             _sent_placeholder = True
