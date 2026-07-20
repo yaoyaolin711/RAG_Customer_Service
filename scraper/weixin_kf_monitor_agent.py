@@ -1,8 +1,8 @@
 """
-飞鸽消息自动化监控与 AI 回复 - 独立 Playwright Agent
+微信小店客服消息自动化监控与 AI 回复 - Playwright Agent
 
 设计思路（API 拦截驱动）：
-  1. 启动浏览器 → 加载登录态 → 进入 Pigeon IM 页面
+  1. 启动浏览器 → 加载登录态 → 进入 微信小店客服 页面
   2. 通过 page.on('response') 监听消息 API 的返回
   3. 自适应解析响应 JSON 中消息结构
   4. 发现新消息 → LLM 生成回复 → 填入 #im-input-box → 发送
@@ -10,10 +10,10 @@
 
 使用流程:
   # 第 1 步：分析 API（登录后等消息到达，自动推荐最优 endpoint）
-  python -m scraper.feige_monitor_agent --store sulida --analyze
+  python -m scraper.weixin_kf_monitor_agent --store zhihuai --analyze
 
   # 第 2 步：启动监控
-  python -m scraper.feige_monitor_agent --store sulida --endpoint "/api/message/poll"
+   python -m scraper.weixin_kf_monitor_agent --store zhihuai --endpoint "/shop/commkf/msg"
 """
 
 import json
@@ -29,6 +29,8 @@ from typing import Optional, Any
 
 from dotenv import load_dotenv
 
+from scraper.reply_history import ReplyHistory
+
 logger = logging.getLogger(__name__)
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
@@ -37,9 +39,8 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 # URL 常量
 # ============================================================
 
-BUYIN_HOME = "https://buyin.jinritemai.com"
-PIGEON_IM_URL = "https://im.jinritemai.com/pc_seller_v2/main/workspace"
-DAREN_SQUARE_URL = "https://buyin.jinritemai.com/dashboard/servicehall/daren-square"
+KF_URL = "https://store.weixin.qq.com/shop/kf"
+HOME_URL = "https://store.weixin.qq.com"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
@@ -48,25 +49,28 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 # ============================================================
 
 API_URL_KEYWORDS = {
-    "message": 3, "im": 3, "chat": 3, "conversation": 3,
+    "kf": 3, "commkf": 3, "msg": 3, "message": 3,
+    "chat": 3, "conversation": 3, "session": 3,
     "poll": 2, "sync": 2, "push": 2, "notice": 2,
     "list": 1, "new": 1, "unread": 3,
+    "send": 2, "receive": 2,
 }
 
 API_JSON_KEYS = {
-    "content": 2, "sender": 2, "from_user": 2, "from": 2,
-    "role": 2, "message": 2, "msg": 2,
-    "timestamp": 1, "send_time": 1, "create_time": 1,
-    "unread": 2, "contact": 2, "nickname": 1, "name": 1,
-    "conversation_id": 2, "session_id": 2,
+    "content": 2, "msg_kf_content": 3, "msg": 2, "message": 2,
+    "from": 2, "role": 2, "sender": 2,
+    "timestamp": 1, "create_time": 1, "send_time": 1,
+    "kf": 2, "customer": 2, "visitor": 2, "user": 1,
+    "room_id": 3, "session_id": 2,
+    "nickname": 1, "name": 1, "extra_info": 2,
+    "msg_direction": 3, "msg_type": 1,
 }
 
 # 消息相关 API 路径特征（正则，用于拦截匹配 + 默认 endpoint 回退）
 API_MESSAGE_PATTERNS = [
-    r"/chat/api/backstage/conversation/get_current_conversation_list",
-    r"/api/.*(?:message|msg|im|chat|conversation)",
-    r"/message/?(?:poll|sync|list|push|new)",
-    r"/im/?(?:poll|sync|push|list)",
+    r"/shop/commkf/msg",
+    r"/api/.*(?:message|msg|chat|conversation|session|kf)",
+    r"/kf/?(?:poll|sync|list|send|receive)",
 ]
 
 # ============================================================
@@ -75,61 +79,57 @@ API_MESSAGE_PATTERNS = [
 
 INJECT_SIDEBAR_OBSERVER_SCRIPT = """
 () => {
-    if (window.__observerActive) return;
-    window.__observerActive = true;
-    window.__pendingConversations = [];
-    window.__observerState = {};
+    if (window.__kfObserverActive) return;
+    window.__kfObserverActive = true;
+    window.__kfPendingConversations = [];
+    window.__kfObserverState = {};
+
+    function pushPending(name, roomId, preview) {
+        var found = window.__kfPendingConversations.find(function(p) { return p.name === name && p.roomId === roomId; });
+        if (!found) {
+            window.__kfPendingConversations.push({ name: name, roomId: roomId, preview: preview });
+        }
+    }
 
     setInterval(function() {
-        var items = document.querySelectorAll('[data-kora="conversation"]');
+        var items = document.querySelectorAll('li.session-item-container');
         items.forEach(function(item) {
-            var titleEl = item.querySelector('[title]:not(sup)');
-            var name = titleEl ? titleEl.getAttribute('title') : '';
+            var nickEl = item.querySelector('.user-nickname');
+            if (!nickEl) return;
+            var name = nickEl.textContent.trim();
             if (!name) return;
 
-            var os = window.__observerState[name] || (window.__observerState[name] = {});
+            var roomId = item.getAttribute('data-room-id') || '';
+            var key = name + '|' + roomId;
 
-            var allText = (item.textContent || '').trim();
-            var m = allText.match(/\\d+\\u79d2|\\u521a\\u521a|\\d+\\u5206\\u949f|(?:^|\\D)(\\d{1,2}:\\d{2})(?:\\D|$)/);
-            var timeText = m ? (m[1] || m[0] || '').trim() : '';
-            if (!timeText) return;
+            var badge = item.querySelector('.unread-badge');
+            var hasUnread = badge && badge.offsetParent !== null;
+            var badgeText = hasUnread ? (badge.textContent || '').trim() : '';
 
-            var isRelative = /[\\u79d2\\u5206\\u949f]|\\u521a\\u521a/.test(timeText);
-            var prevIsRelative = os.prevIsRelative;
+            var previewEl = item.querySelector('.text-content-wrap');
+            var preview = previewEl ? (previewEl.innerText || previewEl.textContent || '') : '';
+            preview = preview.trim();
 
-            // 消息预览：取第二个 [data-btm] 的文本
-            var btms = item.querySelectorAll('[data-btm]');
-            var preview = '';
-            if (btms.length >= 2) {
-                preview = (btms[1].textContent || '').trim();
-            } else {
-                preview = allText.replace(timeText, '').trim();
-            }
-            var prevPreview = os.prevPreview || '';
+            var prev = window.__kfObserverState[key];
 
-            if (timeText) {
-                console.log('[OBSERVER]', JSON.stringify({
-                    name: name,
-                    isRelative: isRelative,
-                    prevIsRelative: prevIsRelative,
-                    preview: preview,
-                    prevPreview: prevPreview,
-                    timeText: timeText,
-                    prevTimeText: os.prevTimeText || ''
-                }));
+            if (!prev) {
+                window.__kfObserverState[key] = { name: name, roomId: roomId, badge: badgeText };
+                if (hasUnread) {
+                    console.log('[KF_OBSERVER] first load unread:', name);
+                    pushPending(name, roomId, preview);
+                }
+                return;
             }
 
-            // 绝对→相对 (新消息)  或  相对时间内内容变化 (又一条)
-            if (isRelative && (!prevIsRelative || preview !== prevPreview)) {
-                console.log('[OBSERVER] PUSH by relative:', name);
-                window.__pendingConversations.push(name);
+            // Only trigger on unread badge changes (new customer message)
+            if (hasUnread && prev.badge !== badgeText) {
+                console.log('[KF_OBSERVER] new msg via badge:', name);
+                pushPending(name, roomId, preview);
             }
 
-            os.prevIsRelative = isRelative;
-            os.prevTimeText = timeText;
-            os.prevPreview = preview;
+            prev.badge = badgeText;
         });
-    }, 1000);
+    }, 300);
 }
 """
 
@@ -139,30 +139,16 @@ INJECT_SIDEBAR_OBSERVER_SCRIPT = """
 
 CLICK_CONTACT_SCRIPT = """
 (name) => {
-    // 1. 精确 title 属性匹配
-    var el = document.querySelector('[title="' + name + '"]');
+    var items = document.querySelectorAll('li.session-item-container');
+    for (var i = 0; i < items.length; i++) {
+        var nickEl = items[i].querySelector('.user-nickname');
+        if (nickEl && nickEl.textContent.trim() === name) {
+            items[i].querySelector('.session-list-card').click();
+            return true;
+        }
+    }
+    var el = document.querySelector('[title="' + name + '"], [aria-label="' + name + '"]');
     if (el) { el.click(); return true; }
-
-    // 2. 遍历 [data-kora="conversation"] 按 title 匹配
-    var items = document.querySelectorAll('[data-kora="conversation"]');
-    for (var i = 0; i < items.length; i++) {
-        var titleEl = items[i].querySelector('[title]:not(sup)');
-        if (titleEl && (titleEl.getAttribute('title') || '').indexOf(name) !== -1) {
-            titleEl.closest('[data-kora="conversation"]') ? items[i].click() : titleEl.click();
-            return true;
-        }
-    }
-
-    // 3. 旧结构兜底
-    items = document.querySelectorAll('.msgItemWrap, [class*="contactCard"], [class*="session"], li, [role="listitem"]');
-    if (items.length === 0) items = document.querySelectorAll('div:has(img)');
-    for (var i = 0; i < items.length; i++) {
-        if ((items[i].textContent || '').trim().indexOf(name) !== -1) {
-            items[i].click();
-            return true;
-        }
-    }
-
     return false;
 }
 """
@@ -174,177 +160,61 @@ CLICK_CONTACT_SCRIPT = """
 EXTRACT_MESSAGES_SCRIPT = """
 () => {
     var results = [];
-    var panel = document.querySelector('.messageList') ||
-                 document.querySelector('[class*="message-list"]') ||
-                 document.querySelector('[class*="chat-content"]') ||
-                 document.querySelector('[class*="chat-body"]');
-    if (!panel) return results;
-    var items = panel.querySelectorAll('.msgItemWrap, [class*="message-item"], [class*="msg-item"], [class*="chat-message"]');
-    if (items.length === 0) items = panel.querySelectorAll(':scope > div > div, :scope > div');
+    var items = document.querySelectorAll('.chat_content_has_room .message-item');
+    if (items.length === 0) return results;
 
     for (var i = 0; i < items.length; i++) {
         var item = items[i];
+        var cls = item.className || '';
+
+        var isMe = cls.indexOf('justify-end') !== -1;
+        var isOther = cls.indexOf('justify-start') !== -1;
+        if (!isMe && !isOther) {
+            if (item.querySelector('.message-time.right')) isMe = true;
+            else isOther = true;
+        }
+
+        var text = '';
         var msgType = 'text';
 
-        // 消息唯一 ID（优先取 messageCard 上的 data-id，兜底取 data-qa-message-id）
-        var msgId = '';
-        var msgCard = item.querySelector('[class*="messageCard"]');
-        if (msgCard) msgId = msgCard.getAttribute('data-id') || '';
-        if (!msgId) msgId = item.getAttribute('data-qa-message-id') || '';
-        if (!msgId) msgId = item.getAttribute('data-id') || '';
-
-        // 转接通知（transfer_staff_）
-        var itemId = item.getAttribute('data-id');
-        if (itemId && itemId.indexOf('transfer_staff_') === 0) {
-            var text = (item.textContent || '').trim();
-            var timeMatch = text.match(/\\d{1,2}:\\d{2}(?::\\d{2})?/);
-            results.push({
-                sender: 'system',
-                content: text.substring(0, 500),
-                timestamp: timeMatch ? timeMatch[0] : '',
-                msg_type: 'transfer',
-                image_url: '',
-                msg_id: msgId,
-            });
-            continue;
-        }
-
-        // 发送方: 用稳定 class messageIsMe / messageNotMe，兜底检查 item 自身 class
-        var isMe = item.querySelector('.messageIsMe, [class*="self"], [class*="mine"], .msg--right, .msg-right, [class*="align-right"]');
-        var isOther = item.querySelector('.messageNotMe, [class*="other"], [class*="opposite"], .msg--left, .msg-left, [class*="align-left"]');
-        if (!isMe && !isOther) {
-            var cls = item.className || '';
-            if (/self|mine|right/i.test(cls)) isMe = item;
-            else if (/other|opposite|left/i.test(cls)) isOther = item;
-            else {
-                var flexRow = item.querySelector('[style*="flex-direction: row"]');
-                if (flexRow && flexRow.children.length >= 2) {
-                    isOther = flexRow.children[0].querySelector('img') ? item : null;
-                    if (!isOther) isMe = item;
-                } else {
-                    continue;
-                }
-            }
-        }
-
-        // 内容: 优先检测商品卡片
-        var card = item.querySelector('.chatd-card');
-        var content = '';
-        if (card) {
-            msgType = 'product_card';
-            var parts = [];
-            var nameSpans = card.querySelectorAll('.pigeon-card-place-holder-text .content span');
-            var nameParts = [];
-            for (var ni = 0; ni < nameSpans.length; ni++) {
-                var nt = (nameSpans[ni].textContent || '').trim();
-                if (nt) nameParts.push(nt);
-            }
-            if (nameParts.length) parts.push(nameParts.join(''));
-            var priceInter = card.querySelector('.chatd-price-price-inter');
-            var priceDecimal = card.querySelector('.chatd-price-price-decimal');
-            if (priceInter) {
-                var p = '￥' + (priceInter.textContent || '').trim();
-                if (priceDecimal) p += '.' + (priceDecimal.textContent || '').trim();
-                parts.push(p);
-            }
-            var phs = card.querySelectorAll('.pigeon-card-place-holder-text .content.max-line');
-            if (phs.length >= 2) {
-                var sales = (phs[1].textContent || '').trim();
-                if (sales) parts.push(sales);
-            }
-
-            // // 保障标签
-            // var tagSpans = card.querySelectorAll('span[style*="border-width"]');
-            // var tags = [];
-            // for (var ti = 0; ti < tagSpans.length; ti++) {
-            //     var tv = (tagSpans[ti].textContent || '').trim();
-            //     if (tv) tags.push(tv);
-            // }
-            // if (tags.length) parts.push(tags.join(', '));
-
-            // // 保障 +N
-            // var countEl = card.querySelector('[class*="tag-group-left-count"]');
-            // if (countEl) {
-            //     var ct = (countEl.textContent || '').trim();
-            //     if (ct) parts.push(ct);
-            // }
-
-            // 物流
-            var allCardSpans = card.querySelectorAll('.pigeon-card-place-holder-text .content span');
-            for (var si = 0; si < allCardSpans.length; si++) {
-                var st = (allCardSpans[si].textContent || '').trim();
-                if (st.indexOf('预计') !== -1 && st.indexOf('发货') !== -1) {
-                    parts.push(st);
-                    break;
-                }
-            }
-
-            // 购买意向检测
-            var inviteBtn = card.querySelector('.pigeon-card-button-list button span');
-            if (inviteBtn && inviteBtn.textContent.trim() === '邀请下单') {
-                parts.push('[消费者发送了此商品，有购买意向]');
-            }
-
-            content = parts.join(' ');
-        }
-
-        // 视频/图片/表情消息兜底
-        if (!content) {
-            var imgs = item.querySelectorAll('img');
-            var imgSrc = '';
-            for (var gi = 0; gi < imgs.length; gi++) {
-                var cls = imgs[gi].className || '';
-                if (/avatar|icon/i.test(cls)) continue;
-                var src = (imgs[gi].getAttribute('src') || '').trim();
-                if (src.length > 30 || /emoji|sticker|gif/i.test(src)) {
-                    imgSrc = src;
-                    break;
-                }
-            }
-            if (imgSrc) {
-                if (imgSrc.indexOf('base64') !== -1) {
-                    content = '[视频]';
-                    msgType = 'video';
-                } else {
-                    content = '[表情]';
-                    msgType = 'emoji';
-                }
+        // 1. 语音消息优先检测
+        var voiceParent = item.closest('[data-type="10"]') || item;
+        var voiceEl = voiceParent.querySelector('[data-type="voice"]');
+        if (voiceEl) {
+            var transcribeEl = voiceEl.querySelector('[class*="whitespace-pre-wrap"]');
+            var transcribeText = transcribeEl ? transcribeEl.textContent.trim() : '';
+            if (transcribeText) {
+                text = '[语音]' + transcribeText;
+                msgType = 'voice';
             } else {
-                var picEl = item.querySelector('img[alt="图片"]');
-                if (picEl) {
-                    content = '[图片]';
-                    msgType = 'image';
-                }
+                text = '[语音]';
+                msgType = 'voice';
             }
         }
 
-        // 非卡片: 取所有 span 中文本最长的那个（跳过空 span 和仅含时间/名字的）
-        if (!content) {
-            var spans = item.querySelectorAll('span');
-            for (var j = 0; j < spans.length; j++) {
-                var t = (spans[j].textContent || '').trim();
-                if (t.length >= 1 && t.length > content.length) {
-                    if (!/^\\d{1,2}:\\d{2}$/.test(t)) {
-                        content = t;
-                    }
-                }
-            }
+        // 2. 纯文本消息
+        if (!text) {
+            var textEl = item.querySelector('.text-msg span');
+            if (textEl) text = textEl.textContent.trim();
         }
 
-        // 时间: 正则匹配 HH:MM
-        var text = (item.textContent || '').trim();
-        var timeMatch = text.match(/\\d{1,2}:\\d{2}(?::\\d{2})?/);
-        var timestamp = timeMatch ? timeMatch[0] : '';
-
-        if (!content) continue;
+        // 3. 视频/图片（跳过语音消息的图标）
+        if (!text) {
+            var hasVideo = item.querySelector('[data-type="video"]') && !voiceParent.querySelector('[data-type="voice"]');
+            if (hasVideo) {
+                text = '[视频]';
+            } else if (item.querySelector('.item-img img, img[alt]')) {
+                text = '[图片]';
+            } else {
+                continue;
+            }
+        }
 
         results.push({
             sender: isMe ? 'me' : 'other',
-            content: content.substring(0, 500),
-            timestamp: timestamp,
+            content: text.substring(0, 500),
+            timestamp: '',
             msg_type: msgType,
-            image_url: '',
-            msg_id: msgId,
         });
     }
     return results;
@@ -357,121 +227,36 @@ EXTRACT_MESSAGES_SCRIPT = """
 
 FILL_INPUT_SCRIPT = """
 (text) => {
-    // 优先 textarea[data-qa-id]
-    var input = document.querySelector('textarea[data-qa-id="qa-send-message-textarea"]');
-    if (!input) input = document.querySelector('#im-input-box');
+    // WeChat store KF input: textarea#input-textarea.text-area
+    var input = document.querySelector('#input-textarea');
+    if (!input) input = document.querySelector('textarea.text-area');
+    if (!input) input = document.querySelector('textarea');
     if (!input) return 'no_input';
 
-    var tag = input.tagName.toLowerCase();
-    if (tag === 'textarea' || tag === 'input') {
-        var nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype, 'value'
-        ).set;
-        nativeSetter.call(input, text);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        return 'textarea';
-    }
-
-    // div / contenteditable
-    input.focus();
-    input.textContent = text;
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    var nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype, 'value'
+    ).set;
+    nativeSetter.call(input, text);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('blur', { bubbles: true }));
-    return 'contenteditable';
+    return 'textarea';
 }
 """
 
 CLICK_SEND_SCRIPT = """
 () => {
-    // 1. 优先 textarea 回车发送（Enter 键）
-    var textarea = document.querySelector('textarea[data-qa-id="qa-send-message-textarea"]');
-    if (textarea) {
-        textarea.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-            bubbles: true, cancelable: true,
-        }));
-        return 'enter_keydown';
-    }
-
-    // 2. 按钮点击
-    var allBtns = document.querySelectorAll('button, [role="button"], input[type="submit"], [class*="send"]');
-    for (var i = 0; i < allBtns.length; i++) {
-        var btn = allBtns[i];
-        if (btn.offsetParent === null) continue;
-        var text = (btn.textContent || '').trim();
-        if (text === '\u53d1\u9001' || text.indexOf('\u53d1\u9001') !== -1 || text === 'Send') {
-            btn.click(); return 'clicked';
-        }
-        var cls = btn.className || '';
-        if (cls.indexOf('send-btn') !== -1 || cls.indexOf('sendBtn') !== -1 || cls.indexOf('chatd-send') !== -1 || cls.indexOf('SendButton') !== -1) {
-            btn.click(); return 'clicked';
-        }
-    }
-
-    // 3. 兜底: 回车
-    var input = document.querySelector('#im-input-box');
+    // WeChat store KF: press Enter on textarea
+    var input = document.querySelector('#input-textarea');
+    if (!input) input = document.querySelector('textarea.text-area');
+    if (!input) input = document.querySelector('textarea');
     if (input) {
         input.dispatchEvent(new KeyboardEvent('keydown', {
             key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
             bubbles: true, cancelable: true,
         }));
-        return 'enter_key';
+        return 'enter';
     }
-    return 'no_button';
-}
-"""
-
-CLICK_TRANSFER_SCRIPT = """
-() => {
-    var btn = document.querySelector('[data-qa-id="qa-transfer-conversation"]');
-    if (!btn) return false;
-    btn.click();
-    return true;
-}
-"""
-
-SELECT_TRANSFER_TARGET_SCRIPT = """
-(agentNames) => {
-    var items = document.querySelectorAll('[data-qa-id="qa-transfer-customer"]');
-    var best = null;
-    var bestCount = 9999;
-    var bestFallback = null;
-    var bestFallbackCount = 9999;
-    for (var i = 0; i < items.length; i++) {
-        var nameEl = items[i].querySelector('.userName-yhkhmJ, .name-FYR8Pd');
-        if (!nameEl) continue;
-        var name = (nameEl.textContent || '').trim();
-        if (!name) continue;
-        var numEl = items[i].querySelector('.num-aqoHIz');
-        var current = 9999;
-        if (numEl) {
-            var m = (numEl.textContent || '').match(/(\d+)\//);
-            if (m) current = parseInt(m[1], 10);
-        }
-        // fallback：记录所有客服中最空闲的
-        if (current < bestFallbackCount) {
-            bestFallbackCount = current;
-            bestFallback = { el: items[i], name: name };
-        }
-        // 匹配名单
-        for (var j = 0; j < agentNames.length; j++) {
-            if (name.indexOf(agentNames[j]) !== -1 || agentNames[j].indexOf(name) !== -1) {
-                if (current < bestCount) {
-                    bestCount = current;
-                    best = { el: items[i], name: name };
-                }
-                break;
-            }
-        }
-    }
-    var target = best || bestFallback;
-    if (target) {
-        target.el.click();
-        return target.name;
-    }
-    return false;
+    return 'no_enter';
 }
 """
 
@@ -494,11 +279,138 @@ GET_SELECTED_CONTACT_SCRIPT = """
 }
 """
 
-class FeigeMonitorAgent:
-    """飞鸽消息自动化监控与 AI 回复（API 拦截驱动，不依赖 DOM 轮询）"""
+ANALYZE_DOM_SCRIPT = """
+() => {
+    const info = {
+        url: window.location.href,
+        title: document.title,
+        textLength: document.body.innerText.length,
+        totalElements: document.querySelectorAll('*').length,
+        classes: {},
+    };
 
-    name = "feige_monitor"
-    display_name = "飞鸽自动监控回复"
+    const counts = {};
+    document.querySelectorAll('[class]').forEach(el => {
+        let cn = el.className;
+        if (typeof cn === 'string') {
+            cn.split(' ').forEach(cls => {
+                const prefix = cls.substring(0, 40);
+                if (!prefix) return;
+                counts[prefix] = (counts[prefix] || 0) + 1;
+            });
+        }
+    });
+    info.classes = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 50);
+
+    info.textareas = Array.from(document.querySelectorAll('textarea')).map(t => ({
+        id: t.id,
+        class: (t.className || '').substring(0, 60),
+        placeholder: (t.placeholder || '').substring(0, 40),
+        visible: t.offsetParent !== null,
+    }));
+
+    info.contenteditables = Array.from(document.querySelectorAll('[contenteditable="true"]')).map(t => ({
+        id: t.id,
+        class: (t.className || '').substring(0, 60),
+        text: (t.textContent || '').substring(0, 40),
+        visible: t.offsetParent !== null,
+    }));
+
+    info.sendButtons = Array.from(document.querySelectorAll('button, [role="button"], a, .weui-desktop-btn')).map(t => ({
+        text: (t.textContent || '').trim().substring(0, 30),
+        class: (t.className || '').substring(0, 60),
+        visible: t.offsetParent !== null,
+    }));
+
+    info.contactElements = Array.from(document.querySelectorAll(
+        '[class*="contact"], [class*="session"], [class*="chat-list"], [class*="conversation"], [class*="kf-list"], [class*="visitor"], [class*="customer"], li, [role="listitem"]'
+    )).slice(0, 20).map(t => ({
+        text: (t.textContent || '').trim().substring(0, 60),
+        class: (t.className || '').substring(0, 60),
+        tag: t.tagName,
+        visible: t.offsetParent !== null,
+    }));
+
+    info.frames = Array.from(document.querySelectorAll('iframe, micro-app, webview')).map(f => ({
+        tag: f.tagName,
+        src: (f.src || '').substring(0, 120),
+        name: f.name || '',
+        id: f.id || '',
+    }));
+
+    info.messageContainers = Array.from(document.querySelectorAll(
+        '[class*="message"], [class*="msg-list"], [class*="chat-content"], [class*="chat-body"], [class*="scroll"]'
+    )).slice(0, 10).map(t => ({
+        class: (t.className || '').substring(0, 60),
+        tag: t.tagName,
+        childCount: t.children.length,
+        text: (t.textContent || '').trim().substring(0, 100),
+        visible: t.offsetParent !== null,
+    }));
+
+    return info;
+}
+"""
+
+ANALYZE_WXA_SCRIPT = """
+() => {
+    const app = document.querySelector('#app, #root, .app, .shop-app, .kf-app, micro-app, [data-wxa]');
+    if (!app) return { noApp: true };
+
+    const result = {
+        appTag: app.tagName,
+        appId: app.id,
+        appClass: (app.className || '').substring(0, 80),
+        shadowDOM: null,
+        vueInfo: null,
+    };
+
+    if (app.shadowRoot) {
+        const sr = app.shadowRoot;
+        result.shadowDOM = {
+            childCount: sr.children.length,
+            htmlLength: sr.innerHTML.length,
+            classes: {},
+        };
+        const counts = {};
+        sr.querySelectorAll('[class]').forEach(el => {
+            let cn = el.className;
+            if (typeof cn === 'string') {
+                cn.split(' ').forEach(cls => {
+                    const p = cls.substring(0, 40);
+                    if (p) counts[p] = (counts[p] || 0) + 1;
+                });
+            }
+        });
+        result.shadowDOM.classes = Object.entries(counts).sort((a,b) => b[1]-a[1]).slice(0, 30);
+    }
+
+    const vueApp = document.querySelector('#app, #root');
+    if (vueApp) {
+        const attrs = {};
+        for (const attr of vueApp.attributes) {
+            attrs[attr.name] = attr.value;
+        }
+        result.vueInfo = { attrs };
+    }
+
+    return result;
+}
+"""
+
+FILTERED_MESSAGES = [
+    "商品不太适合我，暂时不用了",
+    "商品不太适合我",
+    "暂时不需要",
+    "已读",
+]
+
+
+class WeixinKFMonitorAgent:
+    """微信小店客服消息自动化监控与 AI 回复（API 拦截驱动）"""
+
+    name = "weixin_kf_monitor"
+    display_name = "微信小店客服自动监控回复"
 
     def __init__(self, store: str = "", headless: bool = False,
                  dry_run: bool = False, max_replies_per_round: int = 10,
@@ -524,11 +436,14 @@ class FeigeMonitorAgent:
         self._pw = None
         self.running = False
 
-        base_dir = os.path.join(DATA_DIR, store or "pigeon")
+        base_dir = os.path.join(DATA_DIR, store or "weixin")
         self.storage_file = os.path.join(base_dir, "storage_state.json")
         self.cookie_file = os.path.join(base_dir, "cookies.json")
-        self.jinritemai_storage = os.path.join(DATA_DIR, "jinritemai", "storage_state.json")
-        self.jinritemai_cookie = os.path.join(DATA_DIR, "jinritemai", "cookies.json")
+        self._crm_api_base = "http://localhost:7120/api/v1"
+
+        _kf_dir = os.path.join(DATA_DIR, "weixin_kf_monitor")
+        os.makedirs(_kf_dir, exist_ok=True)
+        self.reply_history = ReplyHistory(db_path=os.path.join(_kf_dir, "reply_history.db"))
 
         # ---- API 拦截相关 ----
         self._message_queue: list[dict] = []
@@ -540,37 +455,6 @@ class FeigeMonitorAgent:
         self._seen_msg_ids: set[str] = set()
         self._click_cooldown: dict[str, float] = {}
         self._last_msg_count: dict[str, int] = {}
-        self._session_replied: set[str] = set()
-        self._handoff_contacts: set[str] = set()
-
-        self._crm_api_base = "http://localhost:7120/api/v1"
-        self._service_key = ""
-        try:
-            sk_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "service.key")
-            if os.path.exists(sk_path):
-                self._service_key = open(sk_path, "r").read().strip()
-        except Exception:
-            pass
-
-        self._forbidden_words: list[str] = []
-        fw_path = os.path.join(DATA_DIR, "kf", "forbidden_words.json")
-        if os.path.exists(fw_path):
-            try:
-                with open(fw_path, "r", encoding="utf-8") as f:
-                    self._forbidden_words = json.load(f)
-                logger.info(f"已加载 {len(self._forbidden_words)} 条禁用词")
-            except Exception as e:
-                logger.warning(f"加载禁用词文件失败: {e}")
-
-        self._human_agents: list[str] = []
-        ha_path = os.path.join(DATA_DIR, "kf", "human_agents.json")
-        if os.path.exists(ha_path):
-            try:
-                with open(ha_path, "r", encoding="utf-8") as f:
-                    self._human_agents = json.load(f)
-                logger.info(f"已加载 {len(self._human_agents)} 个人工客服: {self._human_agents}")
-            except Exception as e:
-                logger.warning(f"加载人工名单失败: {e}")
 
     # -----------------------------------------------------------
     # DOM 消息提取（面板）
@@ -584,27 +468,20 @@ class FeigeMonitorAgent:
         if os.path.exists(self.storage_file):
             logger.info(f"使用 storage state: {self.storage_file}")
             return self.storage_file
-        if not self.store and os.path.exists(self.jinritemai_storage):
-            logger.info(f"使用 jinritemai storage fallback: {self.jinritemai_storage}")
-            return self.jinritemai_storage
-        logger.warning("未找到 storage state 文件")
+        logger.warning(f"未找到 storage state 文件: {self.storage_file}")
+        logger.warning("请先运行: python -m scraper.weixin_login")
         return None
 
     def _load_cookies_direct(self) -> bool:
-        candidates = []
         if os.path.exists(self.cookie_file):
-            candidates.append((self.cookie_file, self.store or "pigeon"))
-        if not self.store and os.path.exists(self.jinritemai_cookie):
-            candidates.append((self.jinritemai_cookie, "jinritemai"))
-        for fpath, label in candidates:
             try:
-                with open(fpath, "r", encoding="utf-8") as f:
+                with open(self.cookie_file, "r", encoding="utf-8") as f:
                     cookies = json.load(f)
                 self.context.add_cookies(cookies)
-                logger.info(f"已加载 cookie ({label}): {fpath} ({len(cookies)} 条)")
+                logger.info(f"已加载 cookie: {self.cookie_file} ({len(cookies)} 条)")
                 return True
             except Exception as e:
-                logger.warning(f"加载 cookie ({label}) 失败: {e}")
+                logger.warning(f"加载 cookie 失败: {e}")
         return False
 
     def _save_storage_state(self):
@@ -686,9 +563,11 @@ class FeigeMonitorAgent:
                 self._pw.stop()
         except Exception as e:
             logger.warning(f"关闭浏览器异常: {e}")
+        self.reply_history.close()
+
     def screenshot(self, name: str = "debug"):
         try:
-            out_dir = os.path.join(DATA_DIR, "feige_monitor", "screenshots")
+            out_dir = os.path.join(DATA_DIR, "weixin_kf_monitor", "screenshots")
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"{name}_{datetime.now().strftime('%H%M%S')}.png")
             self.page.screenshot(path=path)
@@ -708,9 +587,9 @@ class FeigeMonitorAgent:
     # -----------------------------------------------------------
 
     def login(self) -> bool:
-        logger.info(f"导航到卖家工作台: {PIGEON_IM_URL}")
+        logger.info(f"导航到客服工作台: {KF_URL}")
         try:
-            self.page.goto(PIGEON_IM_URL, wait_until="load", timeout=120000)
+            self.page.goto(KF_URL, wait_until="load", timeout=120000)
         except Exception as e:
             logger.warning(f"导航超时: {e}")
         time.sleep(8)
@@ -719,13 +598,13 @@ class FeigeMonitorAgent:
 
         if "login" in current_url or "passport" in current_url:
             logger.error("登录态已过期，请先运行:")
-            logger.error(f"  python -m scraper.generic_login --name {self.store or 'pigeon'} --visible")
+            logger.error(f"  python -m scraper.weixin_login")
             self.screenshot("login_redirect")
             return False
 
-        if "im.jinritemai.com" in current_url or "workspace" in current_url:
+        if "store.weixin.qq.com" in current_url:
             text_len = self.page.evaluate("document.body.innerText.length")
-            logger.info(f"卖家工作台已加载，文本长度: {text_len}")
+            logger.info(f"客服工作台已加载，文本长度: {text_len}")
             if text_len > 50:
                 logger.info("登录成功")
                 self._save_storage_state()
@@ -740,68 +619,10 @@ class FeigeMonitorAgent:
                     return True
             logger.warning("页面加载超时")
 
-        if "buyin.jinritemai.com" in current_url:
-            logger.info("在巨量百应页面，尝试通过[消息]按钮进入工作台...")
-            ok = self._click_chat_button()
-            if ok:
-                try:
-                    self.page.wait_for_load_state("load", timeout=30000)
-                except Exception:
-                    pass
-                time.sleep(5)
-                logger.info(f"当前页面: {self.page.url}")
-                for p in self.context.pages:
-                    if p != self.page:
-                        try: p.close()
-                        except Exception: pass
-                self._save_storage_state()
-                return True
-
-        logger.warning("无法进入卖家工作台，当前 URL: {current_url}")
+        logger.warning("无法进入客服工作台，当前 URL: {current_url}")
         self.screenshot("login_failed")
         return False
 
-    def _click_chat_button(self) -> bool:
-        from playwright.sync_api import TimeoutError
-        strategies = [
-            ("#notice-tips-im-anchor-point", "#notice-tips-im-anchor-point"),
-            ("[class*='tool_btn']:has-text('消息')", None),
-            (".btn-item:has-text('消息')", None),
-        ]
-        for sel, explicit_sel in strategies:
-            target = explicit_sel or sel
-            logger.debug(f"尝试点击: {target}")
-            try:
-                with self.context.expect_event("page", timeout=15000) as page_info:
-                    self.page.click(target, timeout=5000)
-                self.page = page_info.value
-                logger.info(f"点击成功: {target}")
-                return True
-            except (TimeoutError, Exception):
-                continue
-        logger.debug("通过 JS dispatchEvent 触发")
-        try:
-            with self.context.expect_event("page", timeout=15000) as page_info:
-                self.page.evaluate("""() => {
-                    const el = document.querySelector('#notice-tips-im-anchor-point');
-                    if (!el) return;
-                    const wrapper = el.closest('[class*="tool_btn"]') || el.parentElement;
-                    if (wrapper) wrapper.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                    else el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                }""")
-            self.page = page_info.value
-            logger.info("JS dispatchEvent 打开新标签页成功")
-            return True
-        except Exception:
-            pass
-        pages = self.context.pages
-        if len(pages) > 1:
-            for p in pages:
-                if "pigeon" in p.url.lower() or "im" in p.url.lower():
-                    self.page = p
-                    logger.info(f"检测到 Pigeon 页面: {p.url}")
-                    return True
-        return False
 
     # -----------------------------------------------------------
     # DOM 交互（点击会话 + 发送消息，API 拦截不需要这些做轮询）
@@ -811,7 +632,7 @@ class FeigeMonitorAgent:
         logger.info(f"点击会话: {name}")
         clicked = self.page.evaluate(CLICK_CONTACT_SCRIPT, name)
         if clicked:
-            time.sleep(0.5)
+            time.sleep(0.2)
             return True
         logger.info(f"滚动查找会话: {name}")
         try:
@@ -845,21 +666,7 @@ class FeigeMonitorAgent:
                     c.scrollTop = c.scrollHeight;
                 }
             }""")
-            time.sleep(1)
-        except Exception:
-            pass
-        try:
-            # 二次滚动确保底部加载完成
-            self.page.evaluate("""() => {
-                const containers = document.querySelectorAll(
-                    '[class*="message-list"], [class*="chat-content"], [class*="chat-body"], ' +
-                    '[class*="im-body"], [class*="scroll"]'
-                );
-                for (const c of containers) {
-                    c.scrollTop = c.scrollHeight;
-                }
-            }""")
-            time.sleep(0.5)
+            time.sleep(0.3)
         except Exception:
             pass
         try:
@@ -891,62 +698,48 @@ class FeigeMonitorAgent:
                 return False
         else:
             logger.debug(f"输入框填充: {fill_result}")
-        time.sleep(0.5)
+        time.sleep(0.3)
         send_result = self.page.evaluate(CLICK_SEND_SCRIPT)
         logger.info(f"发送结果: {send_result}")
         if send_result == "no_button":
             self.screenshot("no_send_button")
             return False
-        time.sleep(1.5)
+        time.sleep(0.5)
         return True
 
-    def transfer_to_human(self) -> bool:
-        logger.info(f"转接人工客服...")
-        # 注释：以下为实际转接逻辑，需要时取消注释
-        # try:
-        #     ok = self.page.evaluate(CLICK_TRANSFER_SCRIPT)
-        #     if not ok:
-        #         logger.warning("未找到转人工按钮")
-        #         return False
-        #     time.sleep(1)
-        #     selected = self.page.evaluate(SELECT_TRANSFER_TARGET_SCRIPT, self._human_agents)
-        #     if selected:
-        #         logger.info(f"转接人工成功 -> {selected}")
-        #         time.sleep(1.5)
-        #         return True
-        #     logger.warning("弹窗中未找到可转接的客服")
-        #     return False
-        # except Exception as e:
-        #     logger.warning(f"转接人工失败: {e}")
-        #     return False
-        return True
+    def click_transfer(self) -> bool:
+        try:
+            btn = self.page.locator('#session-transfer')
+            if btn.count() > 0 and btn.is_visible():
+                btn.click()
+                logger.info("点击转接人工按钮")
+                return True
+            logger.warning("未找到转接按钮")
+            return False
+        except Exception as e:
+            logger.warning(f"点击转接按钮失败: {e}")
+            return False
 
-    def _sanitize_reply(self, text: str) -> str:
-        if not self._forbidden_words:
-            return text
-        for word in self._forbidden_words:
-            if word in text:
-                text = text.replace(word, "**")
-        return text
+    # -----------------------------------------------------------
+    # AI 回复生成
+    # -----------------------------------------------------------
 
     def _api_chat(self, contact_name: str, message_content: str) -> dict:
         if self.sse_mode:
             return self._api_chat_sse(contact_name, message_content)
         try:
             import requests
-            logger.debug(f"[API_CHAT] begin contact={contact_name}")
             resp = requests.post(
                 f"{self._crm_api_base}/chat",
                 json={
                     "message": message_content,
-                    "user_id": self.store or "feige",
+                    "user_id": self.store or "weixin",
                     "buyer_name": contact_name,
                     "session_key": contact_name,
                     "tool_loop": self.tool_loop,
                 },
-                timeout=(10, 120),
+                timeout=(10, 30),
             )
-            logger.debug(f"[API_CHAT] done status={resp.status_code}")
             if resp.ok:
                 body = resp.json()
                 if body.get("state", {}).get("code") == 0:
@@ -960,11 +753,11 @@ class FeigeMonitorAgent:
             else:
                 logger.warning(f"[API_CHAT] HTTP {resp.status_code}")
         except requests.exceptions.ConnectTimeout:
-            logger.warning(f"[API_CHAT] CRM 连接超时 (CRM 未启动?): {self._crm_api_base}")
+            logger.warning(f"[API_CHAT] CRM 连接超时: {self._crm_api_base}")
         except requests.exceptions.ConnectionError as e:
             logger.warning(f"[API_CHAT] CRM 连接失败: {e}")
         except requests.exceptions.Timeout:
-            logger.warning(f"[API_CHAT] CRM 响应超时")
+            logger.warning("[API_CHAT] CRM 响应超时")
         except Exception as e:
             logger.warning(f"[API_CHAT] 异常: {e}")
         return {"answer": "", "needs_handoff": False, "route": ""}
@@ -972,12 +765,11 @@ class FeigeMonitorAgent:
     def _api_chat_sse(self, contact_name: str, message_content: str) -> dict:
         try:
             import requests
-            logger.debug(f"[API_CHAT_SSE] begin contact={contact_name}")
             resp = requests.post(
                 f"{self._crm_api_base}/chat/stream",
                 json={
                     "message": message_content,
-                    "user_id": self.store or "feige",
+                    "user_id": self.store or "weixin",
                     "buyer_name": contact_name,
                     "session_key": contact_name,
                     "tool_loop": self.tool_loop,
@@ -1009,10 +801,9 @@ class FeigeMonitorAgent:
                 elif typ == "error":
                     logger.warning(f"[API_CHAT_SSE] error: {event.get('message', '')}")
                     break
-            logger.debug(f"[API_CHAT_SSE] done answer={answer[:60] if answer else 'empty'}")
             return {"answer": answer, "needs_handoff": needs_handoff, "route": route}
         except requests.exceptions.ConnectTimeout:
-            logger.warning(f"[API_CHAT_SSE] CRM 连接超时 (CRM 未启动?): {self._crm_api_base}")
+            logger.warning(f"[API_CHAT_SSE] CRM 连接超时: {self._crm_api_base}")
         except requests.exceptions.ConnectionError as e:
             logger.warning(f"[API_CHAT_SSE] CRM 连接失败: {e}")
         except requests.exceptions.Timeout:
@@ -1020,6 +811,22 @@ class FeigeMonitorAgent:
         except Exception as e:
             logger.warning(f"[API_CHAT_SSE] 异常: {e}")
         return {"answer": "", "needs_handoff": False, "route": ""}
+
+    def generate_ai_reply(self, customer_message: str, customer_name: str = "") -> str:
+        return ""
+
+    def _get_product_info(self, talent_name: str) -> str:
+        try:
+            from app.storage.talent_db import TalentDB
+            talent = TalentDB().get_talent_by_name(talent_name)
+            if talent and talent.get("shop"):
+                return f"我们的店铺: {talent['shop']}"
+        except Exception:
+            pass
+        return "我们的产品"
+
+    def _should_filter(self, message: str) -> bool:
+        return any(p in message for p in FILTERED_MESSAGES)
 
     # ============================================================
     # API 拦截核心逻辑
@@ -1031,7 +838,7 @@ class FeigeMonitorAgent:
 
         通用规则:
           - dict 同时含 content/text + sender/from/role 等字段
-        飞鸽特定规则:
+        微信小店特定规则:
           - dict 含 messageBody 子字段，且 messageBody 有 content
           - dict 含 msgList 列表（只取列表元素，不递归进 messageBody）
         """
@@ -1051,7 +858,7 @@ class FeigeMonitorAgent:
                 if has_sender or has_time:
                     results.append(data)
 
-            # 飞鸽特定: messageBody + msgList 已在此层处理，跳过子递归避免重复
+            # 微信小店特定: messageBody + msgList 已在此层处理，跳过子递归避免重复
             skip_keys = set()
 
             mb = data.get("messageBody")
@@ -1110,13 +917,13 @@ class FeigeMonitorAgent:
     def _normalize_message(self, raw: dict) -> Optional[dict]:
         """将原始 JSON 消息对象标准化为统一格式
 
-        支持通用结构和飞鸽 Pigeon IM 嵌套结构:
+        支持通用结构和飞鸽 微信小店客服 嵌套结构:
           - 通用: {content, sender, timestamp, ...}
           - 飞鸽: {messageBody: {content, ext: {nickname, sender_role}}, serverMessageId}
         返回: {sender, content, contact_name, timestamp, msg_id} 或 None
         """
         # -------------------------------------------------------
-        # 第一步: 尝试从 messageBody 提取（飞鸽 Pigeon IM 嵌套结构）
+        # 第一步: 尝试从 messageBody 提取（飞鸽 微信小店客服 嵌套结构）
         # -------------------------------------------------------
         mb = raw.get("messageBody")
         if isinstance(mb, dict):
@@ -1170,14 +977,14 @@ class FeigeMonitorAgent:
                 break
 
         contact_name = ""
-        for k in ("contact_name", "nickname", "user_name", "from_user", "name", "friend_name", "contact"):
+        for k in ("contact_name", "nickname", "user_name", "from_user", "name", "visitor_name", "customer_name", "extra_info"):
             v = raw.get(k)
             if v and isinstance(v, str) and len(v) > 1:
                 contact_name = v
                 break
 
         msg_id = ""
-        for k in ("msg_id", "message_id", "id", "uuid", "mid"):
+        for k in ("msg_id", "message_id", "id", "uuid", "mid", "msgid"):
             v = raw.get(k)
             if v and isinstance(v, (str, int)):
                 msg_id = str(v)
@@ -1185,7 +992,7 @@ class FeigeMonitorAgent:
         if not msg_id:
             msg_id = f"{sender}:{content[:50]}:{timestamp}"
 
-        is_me = any(s.lower() in ("me", "self", "mine", "我") for s in (sender, raw.get("role", "")))
+        is_me = any(s.lower() in ("me", "self", "mine", "staff", "kf", "我") for s in (sender, raw.get("role", "")))
 
         return {
             "sender": "me" if is_me else "other",
@@ -1198,18 +1005,58 @@ class FeigeMonitorAgent:
     def _parse_messages_from_api(self, data: Any) -> list[dict]:
         """自适应解析 API 响应中的消息列表
 
-        1. 在 JSON 树中搜索消息结构
-        2. 标准化为统一格式
-        3. 去重（基于 msg_id）
-        4. 返回 [{sender, content, contact_name, timestamp, msg_id}, ...]
+        1. 优先处理微信小店 KF 格式 (msg_kf_content JSON 字符串)
+        2. 回退到通用 JSON 树搜索
+        3. 去重 + 返回
         """
+        # -------------------------------------------------------
+        # 微信小店 KF 专用解析: data.list[].msg_kf_content
+        # -------------------------------------------------------
+        if isinstance(data, dict):
+            msg_list = data.get("list")
+            if isinstance(msg_list, list):
+                kf_messages = []
+                for item in msg_list:
+                    if not isinstance(item, dict):
+                        continue
+                    msg_direction = item.get("msg_direction", 0)
+                    if msg_direction != 1:
+                        continue
+                    raw_content = item.get("msg_kf_content", "{}")
+                    try:
+                        parsed = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+                    except Exception:
+                        parsed = {}
+                    content = parsed.get("content", "")
+                    if not content:
+                        continue
+                    extra_raw = item.get("extra_info", "{}")
+                    try:
+                        extra = json.loads(extra_raw) if isinstance(extra_raw, str) else extra_raw
+                    except Exception:
+                        extra = {}
+                    contact_name = extra.get("nickname", "") or item.get("send_openid", "")
+                    msg_id = str(item.get("msg_id", ""))
+                    kf_messages.append({
+                        "sender": "other",
+                        "content": content.strip(),
+                        "contact_name": contact_name,
+                        "timestamp": str(item.get("create_time", "")),
+                        "msg_id": msg_id or f"kf:{contact_name}:{content[:40]}",
+                    })
+                if kf_messages:
+                    logger.debug(f"KF 格式解析: {len(kf_messages)} 条消息")
+                    return kf_messages
+
+        # -------------------------------------------------------
+        # 通用解析（回退）
+        # -------------------------------------------------------
         raw_messages = self._find_json_message_structures(data)
-        logger.debug(f"API 响应中找到 {len(raw_messages)} 个候选消息结构")
+        logger.debug(f"通用格式中找到 {len(raw_messages)} 个候选消息结构")
 
         if not raw_messages:
             return []
 
-        # 如果没有 contact_name，尝试从响应中提取
         contact_name_hint = ""
         if raw_messages and not raw_messages[0].get("contact_name"):
             contact_name_hint = self._extract_contact_hint(data)
@@ -1225,7 +1072,6 @@ class FeigeMonitorAgent:
                 continue
             normalized.append(msg)
 
-        # 去重
         seen = set()
         unique = []
         for msg in normalized:
@@ -1244,8 +1090,7 @@ class FeigeMonitorAgent:
         rtype = info["type"]
         is_response = hasattr(event, "status")
 
-        # 调试日志（仅 --analyze 模式，避免刷屏）
-        if self._capturing and status and rtype in ("xhr", "fetch"):
+        if status and rtype in ("xhr", "fetch"):
             logger.debug(f"[NET] {method} {status} {rtype} {url[:120]}")
 
         # -------------------------------------------------------
@@ -1271,7 +1116,7 @@ class FeigeMonitorAgent:
         # -------------------------------------------------------
         # 监控模式：仅处理匹配 endpoint 的 HTTP 响应
         # -------------------------------------------------------
-        if not self.running or not self.endpoint:
+        if not self.endpoint:
             return
         if not is_response:
             return
@@ -1282,6 +1127,7 @@ class FeigeMonitorAgent:
 
         try:
             data = event.json()
+            logger.debug(f"原始响应 ({url[:80]}): {json.dumps(data, ensure_ascii=False)[:800]}")
         except Exception:
             return
 
@@ -1294,16 +1140,12 @@ class FeigeMonitorAgent:
     def _on_websocket(self, ws):
         """WebSocket 连接事件 — 记录连接 + 注册帧监听"""
         url = ws.url
-        logger.debug(f"WebSocket: {url[:100]}")
+        logger.info(f"[WS] 连接: {url[:150]}")
+        self._network_log.append({
+            "url": url, "method": "WEBSOCKET", "status": 101,
+            "type": "websocket", "time": datetime.now().isoformat(),
+        })
 
-        # 记录到日志（analyze 模式也需要）
-        if self._capturing:
-            self._network_log.append({
-                "url": url, "method": "WEBSOCKET", "status": 101,
-                "type": "websocket", "time": datetime.now().isoformat(),
-            })
-
-        # 始终注册帧监听（analyze 模式用 self._capturing 控制记录，监控模式用 self.running 控制）
         ws.on("framereceived", lambda f: self._on_ws_frame(url, f))
         ws.on("framesend", lambda f: self._on_ws_frame(url, f))
 
@@ -1313,20 +1155,26 @@ class FeigeMonitorAgent:
         if not text:
             return
 
-        # analyze 模式：记录原始帧文本到日志（仅记录 JSON 格式）
-        if self._capturing:
-            try:
-                json.loads(text)
-                self._network_log.append({
-                    "url": f"{ws_url}#frame",
-                    "method": "WS_FRAME",
-                    "status": 0,
-                    "type": "websocket_frame",
-                    "body_preview": text[:500],
-                    "time": datetime.now().isoformat(),
-                })
-            except (json.JSONDecodeError, TypeError):
-                pass
+        if frame.type == "close":
+            logger.debug(f"[WS] 关闭: {ws_url[:80]}")
+            return
+
+        preview = text[:300]
+        try:
+            json.loads(text)
+            logger.debug(f"[WS] JSON帧 ({ws_url[:80]}): {preview}")
+        except (json.JSONDecodeError, TypeError):
+            logger.debug(f"[WS] 非JSON帧 ({ws_url[:80]}): {preview}")
+            return
+
+        self._network_log.append({
+            "url": f"{ws_url}#frame",
+            "method": "WS_FRAME",
+            "status": 0,
+            "type": "websocket_frame",
+            "body_preview": text[:500],
+            "time": datetime.now().isoformat(),
+        })
 
         # 监控模式：解析 JSON 并入队
         if self.running and self.endpoint and re.search(self.endpoint, ws_url):
@@ -1350,285 +1198,258 @@ class FeigeMonitorAgent:
         if not content or not contact_name:
             return
 
-        # 跳过自己的消息
         if sender == "me":
             return
 
-        # 内存去重
         if msg_id and msg_id in self._seen_msg_ids:
             return
         if msg_id:
             self._seen_msg_ids.add(msg_id)
 
-        # 过滤
+        if self.reply_history.is_replied(contact_name, content):
+            logger.debug(f"已回复过: {contact_name} - {content[:40]}")
+            return
+
         if self._should_filter(content):
             logger.info(f"跳过过滤消息: {contact_name} - {content[:40]}")
             return
 
         logger.info(f"新消息: [{contact_name}] {content[:80]}")
 
-        # 点击会话切换到该联系人
         if not self.click_contact(contact_name):
-            logger.warning(f"无法点击会话 {contact_name}，尝试用联系人名称搜索")
-            # 如果找不到，记录但不阻塞
+            logger.warning(f"无法点击会话 {contact_name}")
             return
+
+        time.sleep(1)
 
         if self.dry_run:
             logger.info(f"[DRY RUN] 将回复 {contact_name}: {content[:60]}")
+            self.reply_history.record(contact_name, content, status="dry_run")
             return
 
-        # AI 回复
-        result = self._api_chat(contact_name, content)
-        reply = result.get("answer", "")
-        if not reply:
-            logger.warning(f"AI 回复生成失败 (CRM 返回空): {contact_name}")
+        if self.fixed_reply:
+            reply = self.fixed_reply
+            needs_handoff = False
+            _sent_placeholder = False
+        else:
+            _sent_placeholder = False
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._api_chat, contact_name, content)
+                try:
+                    result = future.result(timeout=15)
+                    reply = result.get("answer", "")
+                    needs_handoff = result.get("needs_handoff", False)
+                except concurrent.futures.TimeoutError:
+                    _placeholder = random.choice([
+                        "好的，我看到您消息了，正在查询中稍等~",
+                        "嗯嗯，我在呢，我帮您确认下~",
+                        "收到，我查一下后台数据哈~",
+                        "稍等，我核实一下马上回复您~",
+                    ])
+                    self.send_message(_placeholder)
+                    logger.info(f"兜底 [{contact_name}]: {_placeholder}")
+                    _sent_placeholder = True
+                    try:
+                        result = future.result(timeout=60)
+                    except concurrent.futures.TimeoutError:
+                        result = {"answer": "", "needs_handoff": False}
+                    reply = result.get("answer", "")
+                    needs_handoff = result.get("needs_handoff", False)
+        if not reply and not _sent_placeholder:
+            logger.warning(f"AI 回复生成失败: {contact_name}")
             return
-        reply = self._sanitize_reply(reply)
+        if not reply:
+            return
 
         logger.info(f"AI 回复 [{contact_name}]: {reply[:100]}")
 
-        # 发送
+        delay = random.uniform(self.min_delay, self.max_delay)
+        time.sleep(delay)
         sent = self.send_message(reply)
         if sent:
             logger.info(f"回复成功: {contact_name}")
-            if result.get("needs_handoff"):
-                self.transfer_to_human()
+            self.reply_history.record(contact_name, content, reply_content=reply, status="success")
         else:
             logger.error(f"发送失败: {contact_name}")
-
-    def _save_history_turn(self, contact: str, incoming: str, outgoing: str):
-        """将转人工期间的一轮对话写入 CRM 历史库。"""
-        if not contact or (not incoming and not outgoing):
-            return
-        try:
-            import requests
-            resp = requests.post(
-                f"{self._crm_api_base}/history/write",
-                json={
-                    "contact_username": contact,
-                    "self_username": self.store or "feige",
-                    "incoming_message": incoming,
-                    "outgoing_message": outgoing,
-                },
-                timeout=5,
-            )
-            if resp.ok:
-                logger.debug(f"历史写入成功: [{contact}] {incoming[:30]} / {outgoing[:30]}")
-            else:
-                logger.warning(f"历史写入失败: {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"历史写入异常: {e}")
-
-    def _sync_handoff_history(self, contact: str, messages: list[dict]):
-        """检测转接通知，将人工客服期间的对话同步到 CRM 历史库。"""
-        if not contact or not messages:
+            self.reply_history.record(contact_name, content, reply_content=reply, status="send_failed")
             return
 
-        transfer_idx = [
-            i for i, m in enumerate(messages)
-            if m.get("msg_type") == "transfer"
-        ]
-
-        if len(transfer_idx) >= 2:
-            start = transfer_idx[-2]
-            end = transfer_idx[-1]
-            handoff_msgs = messages[start+1:end]
-
-            i = 0
-            saved = 0
-            while i < len(handoff_msgs):
-                msg = handoff_msgs[i]
-                if msg["sender"] == "other":
-                    incoming = msg["content"]
-                    outgoing = ""
-                    j = i + 1
-                    while j < len(handoff_msgs):
-                        if handoff_msgs[j]["sender"] == "me":
-                            outgoing = handoff_msgs[j]["content"]
-                            break
-                        if handoff_msgs[j]["sender"] == "other":
-                            break
-                        j += 1
-                    self._save_history_turn(contact, incoming, outgoing)
-                    saved += 1
-                i += 1
-
-            logger.info(f"转人工历史已同步: [{contact}] {saved} 轮对话")
-
-        if len(transfer_idx) % 2 == 1:
-            self._handoff_contacts.add(contact)
-            logger.info(f"当前在人工客服期: {contact}")
-        else:
-            if contact in self._handoff_contacts:
-                logger.info(f"已从人工切回 AI: {contact}")
-            self._handoff_contacts.discard(contact)
+        if needs_handoff:
+            time.sleep(random.uniform(1, 3))
+            logger.info(f"接口要求转人工: {contact_name}")
+            self.click_transfer()
 
     # -----------------------------------------------------------
     # 监控生命周期
     # -----------------------------------------------------------
 
     def start_monitor(self):
-        """MutationObserver 监测左侧新会话 → click → extract → reply"""
+        """MutationObserver 监测左侧会话预览变化 → click → extract → AI reply → DOM 发送"""
         self.running = True
         logger.info("=" * 60)
-        logger.info("飞鸽监控启动 (Observer 模式)")
-        logger.info(f"  店铺: {self.store or 'pigeon'}")
+        logger.info("微信小店客服监控启动 (Observer 模式)")
+        logger.info(f"  店铺: {self.store or 'weixin'}")
         logger.info(f"  无头模式: {self.headless}")
         logger.info(f"  Dry Run: {self.dry_run}")
-        logger.info(f"  单轮最大回复: {self.max_replies_per_round}")
         logger.info("=" * 60)
 
-        # 注入侧边栏 MutationObserver
         self.page.evaluate(INJECT_SIDEBAR_OBSERVER_SCRIPT)
-        logger.info("MutationObserver 已注入")
+        logger.info("会话监测已注入")
 
         last_stats_time = time.time()
+        processing = set()
 
         try:
             while self.running:
-                new_names = self.page.evaluate("""() => {
-                    var arr = window.__pendingConversations || [];
-                    window.__pendingConversations = [];
+                pending = self.page.evaluate("""() => {
+                    var arr = window.__kfPendingConversations || [];
+                    window.__kfPendingConversations = [];
                     return arr;
                 }""") or []
 
-                for name in new_names:
+                for item in pending:
                     if not self.running:
                         break
-
-                    logger.info(f"新会话: {name}")
-
+                    name = item.get("name", "") if isinstance(item, dict) else str(item)
+                    if not name:
+                        continue
+                    if name in processing:
+                        logger.debug(f"会话加锁中，跳过: {name}")
+                        continue
                     if re.match(r'^\d+$', name):
-                        logger.debug(f"跳过占位符会话: {name}")
                         continue
 
-                    now = time.time()
-                    if now - self._click_cooldown.get(name, 0) < 3:
-                        continue
-                    self._click_cooldown[name] = now
+                    logger.info(f"新会话活动: {name}")
+                    processing.add(name)
 
-                    if not self.click_contact(name):
-                        logger.warning(f"无法点击会话: {name}")
-                        continue
-                    time.sleep(1.5)
+                    try:
+                        if not self.click_contact(name):
+                            logger.warning(f"无法点击会话: {name}")
+                            continue
+                        time.sleep(0.8)
 
-                    messages = self.extract_messages(max_messages=50)
+                        messages = self.extract_messages(max_messages=50)
 
-                    # 检测转接通知，同步人工客服期对话到历史库
-                    self._sync_handoff_history(name, messages)
+                        known = self._last_msg_count.get(name)
+                        if known is None:
+                            new_msgs = []
+                            for msg in reversed(messages):
+                                if msg["sender"] == "other":
+                                    new_msgs.append(msg)
+                                else:
+                                    break
+                            new_msgs.reverse()
+                        else:
+                            new_msgs = [m for m in messages[known:] if m["sender"] == "other"]
 
-                    # 取最后一条"我"回复之后的所有"对方"消息
-                    other_msgs = []
-                    for msg in reversed(messages):
-                        if msg["sender"] == "other":
-                            other_msgs.append(msg)
-                        elif msg["sender"] == "me" and other_msgs:
-                            break
-                    other_msgs.reverse()
+                        if not new_msgs:
+                            logger.debug(f"{name} 无新消息 (已知 {known or 0} / 当前 {len(messages)})")
+                            continue
 
-                    # 过滤掉本次运行已回复过的消息（有 msg_id 才对同 id 去重，无 id 不过滤）
-                    new_msgs = []
-                    for m in other_msgs:
-                        uid = m.get("msg_id", "")
-                        key = f"{name}|id|{uid}" if uid else None
-                        if key is None or key not in self._session_replied:
-                            new_msgs.append(m)
-                            if key is not None:
-                                self._session_replied.add(key)
+                        self._last_msg_count[name] = len(messages)
+                        logger.info(f"{name} 有 {len(new_msgs)} 条新消息: {[m['content'][:20] for m in new_msgs]}")
 
-                    if not new_msgs:
-                        continue
-
-                    logger.info(f"{name} 有 {len(new_msgs)} 条新消息: {[m['content'][:60] for m in new_msgs]}")
-
-                    for msg in new_msgs:
-                        try:
-                            msg_content = msg.get("content", "").strip()
-                            if not msg_content:
+                        for msg in new_msgs:
+                            if not self.running:
+                                break
+                            content = msg.get("content", "").strip()
+                            if not content:
+                                continue
+                            if self._should_filter(content):
+                                continue
+                            if any(kw in content for kw in ("未回复", "请及时处理", "已超过")):
                                 continue
 
                             if self.dry_run:
-                                logger.info(f"[DRY RUN] 将回复 {name}: {msg_content[:60]}")
+                                logger.info(f"[DRY RUN] 将回复 {name}: {content[:60]}")
+                                self.reply_history.record(name, content, status="dry_run")
                                 continue
 
-                            is_media = False
-                            _needs_handoff = False
-                            if '图片' in msg_content:
-                                reply = "图片收到，我看看哈~"
-                                is_media = True
-                            elif '视频' in msg_content:
-                                reply = "视频收到，我先看看~"
-                                is_media = True
-                            else:
-                                if self.fixed_reply:
-                                    logger.debug(f"[REPLY] use fixed_reply for {name}")
-                                    reply = self.fixed_reply
-                                else:
-                                    logger.debug(f"[REPLY] calling _api_chat for {name}")
-                                    _sent_placeholder = False
-                                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                                        future = executor.submit(self._api_chat, name, msg_content)
-                                        try:
-                                            _api_result = future.result(timeout=20)
-                                            reply = _api_result.get("answer", "")
-                                            _needs_handoff = _api_result.get("needs_handoff", False)
-                                        except concurrent.futures.TimeoutError:
-                                            logger.warning(f"[REPLY] _api_chat 慢 (20s)，先发兜底: {name}")
-                                            _placeholder_pool = [
-                                                "嗯嗯，我在呢~，我帮你确认下哈",
-                                                "好的，我看看哈~",
-                                                "稍等，我查一下后台~",
-                                                "收到，我核实一下哈~",
-                                                "我看一下数据哈~",
-                                                "行，我确认一下~",
-                                                "嗯，我帮你看看~",
-                                            ]
-                                            fallback_reply = self._sanitize_reply(random.choice(_placeholder_pool))
-                                            self.send_message(fallback_reply)
-                                            logger.info(f"兜底 [{name}]: {fallback_reply}")
-                                            _sent_placeholder = True
-                                            try:
-                                                _api_result = future.result(timeout=60)
-                                            except concurrent.futures.TimeoutError:
-                                                logger.warning(f"[REPLY] _api_chat 完全超时 (80s): {name}")
-                                                _api_result = {"answer": "", "needs_handoff": False, "route": ""}
-                                            reply = _api_result.get("answer", "")
-                                            _needs_handoff = _api_result.get("needs_handoff", False)
-                                    logger.debug(f"[REPLY] _api_chat returned for {name}: {reply[:60] if reply else 'empty'} handoff={_needs_handoff}")
-                            if not reply and not _sent_placeholder:
-                                logger.warning(f"[REPLY] _api_chat 返回空，使用 fallback: {name}")
-                                reply = "嗯嗯，我在呢~"
-                            reply = self._sanitize_reply(reply)
+                            if msg.get("msg_type") == "voice":
+                                # 语音已转写，去掉前缀走 CRM 回复
+                                content = content.replace("[语音]", "", 1).strip()
+                                if not content:
+                                    continue
+                            elif "[视频]" in content:
+                                reply = "我看看您的视频，稍后回复您"
+                                self.send_message(reply)
+                                self.reply_history.record(name, content, reply_content=reply, status="success")
+                                time.sleep(random.uniform(1, 3))
+                                logger.info(f"视频消息，回复后转接人工: {name}")
+                                self.click_transfer()
+                                continue
+                            elif "[图片]" in content:
+                                reply = "请稍等，我先看看您的消息"
+                                self.send_message(reply)
+                                self.reply_history.record(name, content, reply_content=reply, status="success")
+                                time.sleep(random.uniform(1, 3))
+                                logger.info(f"图片消息，回复后转接人工: {name}")
+                                self.click_transfer()
+                                continue
 
-                            logger.info(f"回复 [{name}]: {reply[:80]}")
+                            if self.fixed_reply:
+                                reply = self.fixed_reply
+                                needs_handoff = False
+                                _sent_placeholder = False
+                            else:
+                                _sent_placeholder = False
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                                    future = executor.submit(self._api_chat, name, content)
+                                    try:
+                                        result = future.result(timeout=15)
+                                        reply = result.get("answer", "")
+                                        needs_handoff = result.get("needs_handoff", False)
+                                    except concurrent.futures.TimeoutError:
+                                        _placeholder = random.choice([
+                                            "好的，我看到您消息了，正在查询中稍等~",
+                                            "嗯嗯，我在呢，我帮您确认下~",
+                                            "收到，我查一下后台数据哈~",
+                                            "稍等，我核实一下马上回复您~",
+                                        ])
+                                        self.send_message(_placeholder)
+                                        logger.info(f"兜底 [{name}]: {_placeholder}")
+                                        _sent_placeholder = True
+                                        try:
+                                            result = future.result(timeout=60)
+                                        except concurrent.futures.TimeoutError:
+                                            result = {"answer": "", "needs_handoff": False}
+                                        reply = result.get("answer", "")
+                                        needs_handoff = result.get("needs_handoff", False)
+                            if not reply and not _sent_placeholder:
+                                continue
+                            if not reply:
+                                continue
 
                             delay = random.uniform(self.min_delay, self.max_delay)
-                            logger.debug(f"随机延迟 {delay:.1f}s...")
                             time.sleep(delay)
                             sent = self.send_message(reply)
                             if sent:
-                                logger.info(f"回复成功: {name}")
-                                if is_media or (reply and _needs_handoff):
-                                    self.transfer_to_human()
+                                logger.info(f"回复成功 {name}: {content[:30]} → {reply[:30]}")
+                                self.reply_history.record(name, content, reply_content=reply, status="success")
                             else:
-                                logger.error(f"发送失败: {name}")
-                        except Exception as e:
-                            logger.error(f"处理消息异常 {name}: {e}", exc_info=True)
-                            continue
+                                logger.error(f"发送失败 {name}: {content[:30]}")
+                                self.reply_history.record(name, content, reply_content=reply, status="send_failed")
+                                continue
 
+                            time.sleep(1)
 
-                # 定期统计
+                            if needs_handoff:
+                                logger.info(f"接口要求转人工: {name}")
+                                self.click_transfer()
+                    finally:
+                        processing.discard(name)
+
                 if time.time() - last_stats_time > 60:
                     try:
                         stats = self.reply_history.get_stats()
                         logger.info(f"统计: 共回复 {stats['total_replies']} 条 | "
                                    f"今日 {stats['today_replies']} 条 | "
-                                   f"{stats['unique_contacts']} 个达人")
+                                   f"{stats['unique_contacts']} 个客户")
                     except Exception:
                         pass
                     last_stats_time = time.time()
 
-                time.sleep(0.1)
+                time.sleep(0.5)
 
         except KeyboardInterrupt:
             logger.info("用户中断")
@@ -1638,12 +1459,50 @@ class FeigeMonitorAgent:
     def stop(self):
         self.running = False
 
+    # -----------------------------------------------------------
+    # DOM 结构分析
+    # -----------------------------------------------------------
+
+    def analyze_dom(self) -> dict:
+        """全面分析页面 DOM 结构"""
+        logger.info("分析页面 DOM 结构...")
+        self.screenshot("dom_analysis")
+        self._save_html_snapshot("page")
+        analysis = self.page.evaluate(ANALYZE_DOM_SCRIPT)
+        logger.info(f"页面 URL: {analysis.get('url', '?')}")
+        logger.info(f"页面标题: {analysis.get('title', '?')}")
+        logger.info(f"文本长度: {analysis.get('textLength', '?')}")
+        logger.info(f"总元素数: {analysis.get('totalElements', '?')}")
+        for key in ("textareas", "contenteditables", "sendButtons", "contactElements", "frames", "messageContainers"):
+            items = analysis.get(key, [])
+            label = {"textareas": "输入框(textarea)", "contenteditables": "可编辑 div", "sendButtons": "发送按钮", "contactElements": "联系人元素", "frames": "iframe/micro-app", "messageContainers": "消息容器"}.get(key, key)
+            logger.info(f"{label}: {len(items)} 个")
+            for t in items[:5]:
+                logger.info(f"  {t}")
+        wxa = self.page.evaluate(ANALYZE_WXA_SCRIPT)
+        analysis["wxa"] = wxa
+        if isinstance(wxa, dict) and wxa.get("shadowDOM"):
+            logger.info(f"Shadow DOM: {len(wxa['shadowDOM']['classes'])} 个类")
+        return analysis
+
+    def _save_html_snapshot(self, name: str = "page"):
+        try:
+            out_dir = os.path.join(DATA_DIR, "weixin_kf_monitor")
+            os.makedirs(out_dir, exist_ok=True)
+            html = self.page.content()
+            path = os.path.join(out_dir, f"{name}.html")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+            logger.info(f"HTML 快照已保存 ({len(html)} chars): {path}")
+        except Exception as e:
+            logger.warning(f"保存 HTML 失败: {e}")
+
     # ============================================================
     # 网络分析模式（--analyze）
     # ============================================================
 
     def analyze_network(self, duration: int = 120):
-        """分析卖家工作台的网络请求，自动推荐消息 API endpoint（监听已在 start() 中注册）"""
+        """分析客服工作台的网络请求，自动推荐消息 API endpoint（监听已在 start() 中注册）"""
         total_so_far = len(self._network_log)
         json_so_far = len(self._captured_responses)
 
@@ -1653,7 +1512,6 @@ class FeigeMonitorAgent:
         logger.info("请在浏览器中操作：点击会话、刷新页面、或等待消息到达")
         logger.info("=" * 60)
 
-        # 提示用户是否刷新页面以触发更多请求
         logger.info("已开启捕获，当前日志保留，持续记录中...")
         logger.info(f"（按 Enter 提前分析，或等待 {duration} 秒自动分析）")
 
@@ -1679,7 +1537,7 @@ class FeigeMonitorAgent:
         self._print_scored_endpoints(scored)
 
         # 保存日志
-        out_dir = os.path.join(DATA_DIR, "feige_monitor")
+        out_dir = os.path.join(DATA_DIR, "weixin_kf_monitor")
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, "network_analysis.json")
         output = {
@@ -1701,7 +1559,7 @@ class FeigeMonitorAgent:
             logger.info("")
             logger.info("=" * 60)
             logger.info("推荐使用以下命令启动监控:")
-            logger.info(f"  python -m scraper.feige_monitor_agent --store {self.store or 'pigeon'} --endpoint \"{best['url_pattern']}\"")
+            logger.info(f"  python -m scraper.weixin_kf_monitor_agent --store {self.store or 'pigeon'} --endpoint \"{best['url_pattern']}\"")
             logger.info("=" * 60)
 
         return scored
@@ -1820,25 +1678,25 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="飞鸽消息自动化监控与 AI 回复（轮询 conversation_list API）",
+        description="微信小店客服消息自动化监控与 AI 回复",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用流程:
-  第1步 — 分析 API（可选，查看网络结构）:
-    python -m scraper.feige_monitor_agent --store sulida --analyze
+  第1步 — 先登录:
+    python -m scraper.weixin_login
 
-  启动监控:
-    python -m scraper.feige_monitor_agent --store sulida
+  第2步 — 分析页面结构 + API:
+    python -m scraper.weixin_kf_monitor_agent --store zhihuai --analyze
 
-  固定回复:
-    python -m scraper.feige_monitor_agent --store sulida --fixed-reply "你好，有什么可以帮您的？"
+  第3步 — 交互式探查（可选）:
+    python -m scraper.weixin_kf_monitor_agent --store zhihuai --interactive
 
-  预览不回复:
-    python -m scraper.feige_monitor_agent --store sulida --dry-run
+  第4步 — 启动监控:
+    python -m scraper.weixin_kf_monitor_agent --store zhihuai
         """,
     )
     parser.add_argument("--store", type=str, default="",
-                        help="店铺目录名，对应 data/{store}/ 下的 storage_state (默认 data/pigeon/)")
+                        help="店铺目录名，对应 data/{store}/ 下的 storage_state (默认 data/weixin/)")
     parser.add_argument("--headless", action="store_true",
                         help="无头模式（默认 False）")
     parser.add_argument("--dry-run", action="store_true",
@@ -1859,6 +1717,8 @@ def main():
                         help="网络分析模式：捕获 API 请求，自动推荐消息 endpoint")
     parser.add_argument("--duration", type=int, default=120,
                         help="--analyze 模式持续时间（秒，默认 120）")
+    parser.add_argument("--interactive", "-i", action="store_true",
+                        help="交互模式：打开浏览器后可手动操作")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="详细日志")
     parser.add_argument("--tool-loop", action="store_true",
@@ -1874,7 +1734,7 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    agent = FeigeMonitorAgent(
+    agent = WeixinKFMonitorAgent(
         store=args.store,
         headless=args.headless,
         dry_run=args.dry_run,
@@ -1892,6 +1752,9 @@ def main():
         logger.info("启动浏览器...")
         agent.start()
 
+        if args.analyze or args.interactive:
+            agent._capturing = True
+
         ok = agent.login()
         if not ok:
             logger.error("登录失败")
@@ -1900,7 +1763,21 @@ def main():
         agent._wait_stable()
 
         if args.analyze:
+            agent.analyze_dom()
+            agent.screenshot("before_analysis")
             agent.analyze_network(duration=args.duration)
+        elif args.interactive:
+            agent.analyze_dom()
+            agent.screenshot("interactive_mode")
+            logger.info("=" * 60)
+            logger.info("交互模式 — 浏览器已打开，可手动操作")
+            logger.info("按 Ctrl+C 退出")
+            logger.info("=" * 60)
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                logger.info("用户中断")
         else:
             agent.start_monitor()
 

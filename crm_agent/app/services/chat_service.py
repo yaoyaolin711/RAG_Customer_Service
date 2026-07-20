@@ -232,6 +232,32 @@ def _serialize_agent_result(
     }
 
 
+def _build_ctx_from_body(
+    message: str, user_id: str = "buyer_demo_001",
+    buyer_name: str = "", talent_id: str = "",
+    session_key: str = "", contact_username: str = "",
+    tool_loop: bool = False,
+) -> dict[str, Any]:
+    text = message.strip()
+    profile_name = (buyer_name or talent_id or "").strip() or user_id
+    contact = (session_key or contact_username or "").strip() or user_id
+    _ctx_cfg = config.context
+    prior_summaries = _load_prior_summaries(user_id)
+    return {
+        "message": text,
+        "session_key": contact,
+        "contact_username": contact,
+        "buyer_profile": f"昵称/ID：{profile_name}",
+        "talent_profile": f"昵称/ID：{profile_name}",
+        "session_id": f"session_{user_id}",
+        "history_limit": _ctx_cfg.get("history_limit", 50),
+        "recent_history_limit": _ctx_cfg.get("recent_history_limit", 10),
+        "prior_summaries": prior_summaries,
+        "l2_summary": prior_summaries[-1] if prior_summaries else None,
+        "tool_loop": tool_loop,
+    }
+
+
 def handle_chat(
     message: str,
     mode: ChatMode = ChatMode.AUTO,
@@ -255,22 +281,14 @@ def handle_chat(
 
     profile_name = (buyer_name or talent_id or "").strip() or user_id
     contact = (session_key or contact_username or "").strip() or user_id
-
-    _ctx_cfg = config.context
-    prior_summaries = _load_prior_summaries(user_id)
-    _ctx = {
-        "message": text,
-        "session_key": contact,
-        "contact_username": contact,
-        "buyer_profile": f"昵称/ID：{profile_name}",
-        "talent_profile": f"昵称/ID：{profile_name}",  # 兼容旧键
-        "session_id": f"session_{user_id}",
-        "history_limit": _ctx_cfg.get("history_limit", 50),
-        "recent_history_limit": _ctx_cfg.get("recent_history_limit", 10),
-        "prior_summaries": prior_summaries,
-        "l2_summary": prior_summaries[-1] if prior_summaries else None,
-        "tool_loop": tool_loop,
-    }
+    _ctx = _build_ctx_from_body(
+        message=text, user_id=user_id,
+        buyer_name=buyer_name, talent_id=talent_id,
+        session_key=session_key, contact_username=contact_username,
+        tool_loop=tool_loop,
+    )
+    contact = _ctx["session_key"]
+    user_id = _ctx["session_id"].replace("session_", "")
     agent = _get_unified_agent()
     result = agent.invoke({
         "task": f"用户新消息：{text}",

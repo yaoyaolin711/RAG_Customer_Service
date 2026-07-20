@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from app.agents.talent_base import TalentBaseAgent
 from app.agents.tools.rag_tools import SEARCH_KNOWLEDGE_BASE_TOOL, search_knowledge_base
@@ -410,7 +410,8 @@ class UnifiedReplyAgent(TalentBaseAgent):
             "error": None,
         }
 
-    def _invoke_flexible(self, context: dict, message: str, user_id: str) -> dict:
+    def _invoke_flexible(self, context: dict, message: str, user_id: str,
+                         event_callback: Callable[[str, dict], None] | None = None) -> dict:
         """迭代式工具调用模式：LLM 自主选择工具，循环执行。"""
         history = self._load_history(context)
         tools_used: list[dict] = []
@@ -490,6 +491,13 @@ class UnifiedReplyAgent(TalentBaseAgent):
                             for c in tool_calls]
             logger.info(f"[FLEXIBLE] LLM 调了 {len(tool_calls)} 个工具: "
                         f"{json.dumps(_tool_detail, ensure_ascii=False)}")
+            if event_callback:
+                for td in _tool_detail:
+                    try:
+                        args = json.loads(td['args']) if isinstance(td['args'], str) else td['args']
+                    except json.JSONDecodeError:
+                        args = {}
+                    event_callback("tool_call", {"name": td['name'], "args": args})
             state.messages.append(msg)
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -531,6 +539,8 @@ class UnifiedReplyAgent(TalentBaseAgent):
                         if isinstance(tool_result.result, dict)
                         else str(tool_result.result or "")
                     )
+                    if event_callback:
+                        event_callback("tool_result", {"name": tool_name, "summary": result_content[:200]})
                     logger.info(f"[FLEXIBLE] 工具 '{tool_name}' 返回: {result_content}")
                     state.messages.append({
                         "role": "tool",
@@ -588,3 +598,15 @@ class UnifiedReplyAgent(TalentBaseAgent):
             "success": True,
             "error": None,
         }
+
+    def invoke_stream(self, input_data: dict,
+                      event_callback: Callable[[str, dict], None] | None = None) -> dict:
+        context = dict(input_data.get("context") or {})
+        message = (context.get("message") or input_data.get("task", "")).strip()
+        if message.startswith("达人的新消息："):
+            message = message.replace("达人的新消息：", "", 1).strip()
+        elif message.startswith("用户新消息："):
+            message = message.replace("用户新消息：", "", 1).strip()
+        context["message"] = message
+        user_id = context.get("session_id", "wx_demo_user_001").replace("session_", "")
+        return self._invoke_flexible(context, message, user_id, event_callback=event_callback)

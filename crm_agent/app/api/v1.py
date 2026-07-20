@@ -8,7 +8,15 @@ RAG Agent 统一 API v1 — 抖音店铺买家智能问答
 
 from __future__ import annotations
 
+import asyncio
+import json
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from app.api.response import api_ok
 from app.api.schemas import (
@@ -20,8 +28,27 @@ from app.api.schemas import (
     HistoryWriteResponse,
     MetaResponse,
 )
+from app.agents.unified_reply import UnifiedReplyAgent
 from app.services.chat_history import delete_export_messages, get_export_contacts, get_export_messages, save_chat_turn
-from app.services.chat_service import get_health, get_meta, handle_chat
+from app.services.chat_service import get_health, get_meta, handle_chat, _build_ctx_from_body
+
+_unified_agent: UnifiedReplyAgent | None = None
+
+def _get_agent() -> UnifiedReplyAgent:
+    global _unified_agent
+    if _unified_agent is None:
+        _unified_agent = UnifiedReplyAgent()
+    return _unified_agent
+
+_PLACEHOLDER_POOL = [
+    "嗯嗯，我在呢~，我帮你确认下哈",
+    "好的，我看看哈~",
+    "稍等，我查一下后台~",
+    "收到，我核实一下哈~",
+    "我看一下数据哈~",
+    "行，我确认一下~",
+    "嗯，我帮你看看~",
+]
 
 router = APIRouter()
 
@@ -68,6 +95,88 @@ def unified_chat(body: ChatRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/chat/stream",
+    summary="流式聊天接口（SSE）",
+    description="""
+SSE 事件流：
+- placeholder: 请求 10 秒后发占位回复
+- tool_call: LLM 决定调用的工具（name, args）
+- tool_result: 工具执行结果（name, summary）
+- result: 最终回复（text, sources）
+""",
+)
+async def unified_chat_stream(body: ChatRequest):
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _send(event_type: str, data: dict[str, Any]):
+        loop.call_soon_threadsafe(queue.put_nowait, (event_type, data))
+
+    def _sync_run():
+        _sent_placeholder = False
+        try:
+            ctx = _build_ctx_from_body(
+                message=body.message, user_id=body.user_id,
+                buyer_name=body.buyer_name, talent_id=body.talent_id,
+                session_key=body.session_key, contact_username=body.contact_username,
+                tool_loop=body.tool_loop,
+            )
+            task = f"用户新消息：{body.message}"
+
+            def callback(typ: str, data: dict[str, Any]):
+                _send(typ, data)
+
+            agent = _get_agent()
+            result = agent.invoke_stream(
+                input_data={"task": task, "context": ctx},
+                event_callback=callback,
+            )
+            _sent_placeholder = True
+
+            if result.get("success"):
+                output = result.get("output", {})
+                _send("result", {
+                    "text": output.get("result", ""),
+                    "sources": output.get("sources", []),
+                    "needs_handoff": output.get("needs_handoff", False),
+                    "route": output.get("route", ""),
+                })
+            else:
+                _send("error", {"message": result.get("error", "未知错误")})
+        except Exception as e:
+            _send("error", {"message": str(e)})
+        finally:
+            if not _sent_placeholder:
+                _send("placeholder", {"text": random.choice(_PLACEHOLDER_POOL)})
+            _send("__done__", {})
+
+    def _timer_thread():
+        time.sleep(10)
+        loop.call_soon_threadsafe(queue.put_nowait, ("__timer__", {}))
+
+    async def event_generator():
+        import threading
+        threading.Thread(target=_timer_thread, daemon=True).start()
+        result_sent = False
+
+        with ThreadPoolExecutor() as pool:
+            pool.submit(_sync_run)
+            while True:
+                typ, data = await queue.get()
+                if typ == "__done__":
+                    break
+                if typ == "__timer__":
+                    if not result_sent:
+                        yield f"data: {json.dumps({'type': 'placeholder', 'text': random.choice(_PLACEHOLDER_POOL)}, ensure_ascii=False)}\n\n"
+                    continue
+                if typ == "result":
+                    result_sent = True
+                yield f"data: {json.dumps({'type': typ, **data}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.get(
