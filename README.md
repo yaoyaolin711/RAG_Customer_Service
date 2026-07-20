@@ -98,7 +98,7 @@ RAG_Agent/
 └── start_api.bat
 ```
 
-启动 API 后打开 **http://localhost:7120/console/** 即可联调。独立打开静态页时可用 `?api=http://localhost:7120` 指定后端。
+启动 API 后打开 **http://localhost:7120/console/** 即可联调。独立打开静态页时可用 `?api=http://localhost:7120` 指定后端
 
 ## Streamlit 模拟台（RAG_mode，可选）
 
