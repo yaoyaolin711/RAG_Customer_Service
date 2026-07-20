@@ -221,17 +221,8 @@ class UnifiedReplyAgent(TalentBaseAgent):
         }]
 
         route = decision.route
-        if route == RouteType.TRANSACTION:
-            resp = self._transaction.handle(user_id, message, intent)
-            return {
-                "agent": self.name,
-                "output": self._handler_response_to_output(
-                    resp, tools_used=tools_used, history_count=len(history)
-                ),
-                "success": True,
-                "error": None,
-            }
 
+        # 投诉类直接转人工，跳过缓存
         if route == RouteType.COMPLAINT_HANDOFF:
             resp = self._complaint.handle(user_id, message, intent)
             return {
@@ -243,29 +234,12 @@ class UnifiedReplyAgent(TalentBaseAgent):
                 "error": None,
             }
 
-        if route in (RouteType.CASUAL_CHAT, RouteType.FALLBACK):
-            resp = self._casual.handle(
-                user_id, message, intent,
-                history=history,
-                recent_history_limit=context.get("recent_history_limit", 10),
-                fallback=(route == RouteType.FALLBACK),
-            )
-            return {
-                "agent": self.name,
-                "output": self._handler_response_to_output(
-                    resp, tools_used=tools_used, history_count=len(history)
-                ),
-                "success": True,
-                "error": None,
-            }
-
-        # 咨询类 → 缓存问答（exact → BM25 → MySQL）→ miss 再 RAG
+        # 非投诉路由 → 缓存问答（exact → semantic）→ hit 直接返回
         try:
             from services.qa_cache import hit_to_response, lookup_qa_cache
-
             cache_hit = lookup_qa_cache(message)
         except Exception:
-            logger.exception("QA 缓存查询失败，回退 RAG")
+            logger.exception("QA 缓存查询失败，回退对应 handler")
             cache_hit = None
 
         if cache_hit is not None:
@@ -288,6 +262,34 @@ class UnifiedReplyAgent(TalentBaseAgent):
                     tools_used=tools_used,
                     history_count=len(history),
                     rag_hit=True,
+                ),
+                "success": True,
+                "error": None,
+            }
+
+        # 缓存未命中 → 按原始路由分发
+        if route == RouteType.TRANSACTION:
+            resp = self._transaction.handle(user_id, message, intent)
+            return {
+                "agent": self.name,
+                "output": self._handler_response_to_output(
+                    resp, tools_used=tools_used, history_count=len(history)
+                ),
+                "success": True,
+                "error": None,
+            }
+
+        if route in (RouteType.CASUAL_CHAT, RouteType.FALLBACK):
+            resp = self._casual.handle(
+                user_id, message, intent,
+                history=history,
+                recent_history_limit=context.get("recent_history_limit", 10),
+                fallback=(route == RouteType.FALLBACK),
+            )
+            return {
+                "agent": self.name,
+                "output": self._handler_response_to_output(
+                    resp, tools_used=tools_used, history_count=len(history)
                 ),
                 "success": True,
                 "error": None,
@@ -439,6 +441,37 @@ class UnifiedReplyAgent(TalentBaseAgent):
                     resp, tools_used=tools_used, history_count=len(history)
                 ),
                 "success": True,
+            }
+
+        # 非投诉路由 → 缓存问答（exact → semantic）→ hit 直接返回
+        try:
+            from services.qa_cache import hit_to_response, lookup_qa_cache
+            cache_hit = lookup_qa_cache(message)
+        except Exception:
+            logger.exception("QA 缓存查询失败，回退 LLM")
+            cache_hit = None
+
+        if cache_hit is not None:
+            resp = hit_to_response(user_id, message, cache_hit, intent=intent)
+            tools_used.append({
+                "tool": "qa_cache",
+                "input": {"query": message},
+                "success": True,
+                "result": {
+                    "hit": True,
+                    "match_type": cache_hit.match_type,
+                    "faq_id": cache_hit.faq_id,
+                    "score": cache_hit.score,
+                },
+            })
+            output = self._handler_response_to_output(
+                resp, tools_used=tools_used, history_count=len(history), rag_hit=True,
+            )
+            return {
+                "agent": self.name,
+                "output": output,
+                "success": True,
+                "error": None,
             }
 
         messages = self.build_messages(f"用户新消息：{message}", context)
